@@ -695,3 +695,41 @@ class RewardValueModel:
         )
 
         return reward
+
+    @torch.inference_mode()
+    def compute_uncertainty(
+            self,
+            prompt: str,
+            response: str,
+            num_mc: int = 20,
+            uncertainty_type: str = "std",
+    ) -> float:
+
+        reward_samples = self.predict_mc(
+            prompt=prompt,
+            response=response,
+            num_mc=num_mc,
+        )
+
+        if uncertainty_type == "std":
+
+            uncertainty = reward_samples.std(
+                unbiased=False
+            )
+
+        elif uncertainty_type == "mean_distance":
+
+            reward_mean = reward_samples.mean()
+
+            uncertainty = (
+                    reward_samples - reward_mean
+            ).abs().mean()
+
+        else:
+            raise ValueError(
+                f"Unsupported uncertainty_type: "
+                f"{uncertainty_type}. "
+                f"Choose from ['std', 'mean_distance']."
+            )
+
+        return uncertainty.item()
