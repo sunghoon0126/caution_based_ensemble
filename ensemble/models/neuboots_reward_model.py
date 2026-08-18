@@ -600,68 +600,68 @@ class RewardValueModel:
         # Set predictor to eval mode
         self.predictor_network.eval()
 
-@torch.inference_mode()
-def compare_reward(
+    @torch.inference_mode()
+    def compare_reward(
+            self,
+            prompt: str,
+            response: str,
+    ) -> Dict[str, float]:
+
+        inputs = self.tokenizer(
+            prompt,
+            response,
+            return_tensors="pt",
+            truncation=True,
+        ).to(self.device)
+
+        outputs = self.reward_model(**inputs)
+
+        target_reward = outputs.logits.squeeze(-1).item()
+
+        predictor_reward = self.predictor_network(
+            inputs["input_ids"],
+            inputs["attention_mask"]
+        ).item()
+
+        error = abs(
+            predictor_reward - target_reward
+        )
+
+        return {
+            "target_reward": target_reward,
+            "predictor_reward": predictor_reward,
+            "absolute error": error
+        }
+
+    @torch.inference_mode()
+    def predict_mc(
         self,
         prompt: str,
         response: str,
-) -> Dict[str, float]:
+        num_mc: int = 20,
+    ) -> torch.Tensor:
 
-    inputs = self.tokenizer(
-        prompt,
-        response,
-        return_tensors="pt",
-        truncation=True,
-    ).to(self.device)
+        if num_mc <= 0:
+            raise ValueError(
+                f"num_mc must be positive, got {num_mc}"
+            )
 
-    outputs = self.reward_model(**inputs)
+        self.predictor_network.eval()
 
-    target_reward = outputs.logits.squeeze(-1).item()
+        inputs = self.tokenizer(
+            prompt,
+            response,
+            return_tensors="pt",
+            truncation=True,
+            max_length=512,
+        ).to(self.device)
 
-    predictor_reward = self.predictor_network(
-        inputs["input_ids"],
-        inputs["attention_mask"]
-    ).item()
-
-    error = abs(
-        predictor_reward - target_reward
-    )
-
-    return {
-        "target_reward": target_reward,
-        "predictor_reward": predictor_reward,
-        "absolute error": error
-    }
-
-@torch.inference_mode()
-def predict_mc(
-    self,
-    prompt: str,
-    response: str,
-    num_mc: int = 20,
-) -> torch.Tensor:
-
-    if num_mc <= 0:
-        raise ValueError(
-            f"num_mc must be positive, got {num_mc}"
+        reward_samples = self.predictor_network(
+            inputs["input_ids"],
+            inputs["attention_mask"],
+            alpha=num_mc,
         )
 
-    self.predictor_network.eval()
+        reward_samples = reward_samples[:, 0]
 
-    inputs = self.tokenizer(
-        prompt,
-        response,
-        return_tensors="pt",
-        truncation=True,
-        max_length=512,
-    ).to(self.device)
-
-    reward_samples = self.predictor_network(
-        inputs["input_ids"],
-        inputs["attention_mask"],
-        alpha=num_mc,
-    )
-
-    reward_samples = reward_samples[:, 0]
-
-    return reward_samples.cpu()
+        return reward_samples.cpu()
