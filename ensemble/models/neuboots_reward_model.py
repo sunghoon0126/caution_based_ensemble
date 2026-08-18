@@ -612,7 +612,10 @@ class RewardValueModel:
             response,
             return_tensors="pt",
             truncation=True,
+            max_length=512,
         ).to(self.device)
+
+        self.predictor_network.eval()
 
         outputs = self.reward_model(**inputs)
 
@@ -630,7 +633,7 @@ class RewardValueModel:
         return {
             "target_reward": target_reward,
             "predictor_reward": predictor_reward,
-            "absolute error": error
+            "absolute_error": error,
         }
 
     @torch.inference_mode()
@@ -665,3 +668,30 @@ class RewardValueModel:
         reward_samples = reward_samples[:, 0]
 
         return reward_samples.cpu()
+
+    @torch.inference_mode()
+    def compute_reward_score(
+            self,
+            prompt: str,
+            response: str,
+    ) -> float:
+
+        inputs = self.tokenizer(
+            prompt,
+            response,
+            return_tensors="pt",
+            truncation=True,
+            max_length=512,
+        ).to(self.device)
+
+        outputs = self.reward_model(
+            **inputs
+        )
+
+        reward = (
+            outputs.logits
+            .squeeze(-1)
+            .item()
+        )
+
+        return reward
