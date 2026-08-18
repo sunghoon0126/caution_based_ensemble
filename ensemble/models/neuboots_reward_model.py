@@ -696,20 +696,16 @@ class RewardValueModel:
 
         return reward
 
-    @torch.inference_mode()
-    def compute_uncertainty(
+    def compute_uncertainty_from_samples(
             self,
-            prompt: str,
-            response: str,
-            num_mc: int = 20,
+            reward_samples: torch.Tensor,
             uncertainty_type: str = "std",
     ) -> float:
 
-        reward_samples = self.predict_mc(
-            prompt=prompt,
-            response=response,
-            num_mc=num_mc,
-        )
+        if reward_samples.numel() == 0:
+            raise ValueError(
+                "reward_samples must not be empty"
+            )
 
         if uncertainty_type == "std":
 
@@ -733,3 +729,64 @@ class RewardValueModel:
             )
 
         return uncertainty.item()
+
+    @torch.inference_mode()
+    def compute_uncertainty(
+            self,
+            prompt: str,
+            response: str,
+            num_mc: int = 20,
+            uncertainty_type: str = "std",
+    ) -> float:
+
+        reward_samples = self.predict_mc(
+            prompt=prompt,
+            response=response,
+            num_mc=num_mc,
+        )
+
+        return self.compute_uncertainty_from_samples(
+            reward_samples=reward_samples,
+            uncertainty_type=uncertainty_type,
+        )
+
+    @torch.inference_mode()
+    def compute_pessimistic_score(
+            self,
+            prompt: str,
+            response: str,
+            num_mc: int = 20,
+            uncertainty_type: str = "std",
+            pessimism_weight: float = 1.0,
+    ) -> Dict[str, float]:
+
+        # 1. Original reward model score
+        reward = self.compute_reward_score(
+            prompt=prompt,
+            response=response,
+        )
+
+        # 2. NeuBoots MC reward predictions
+        reward_samples = self.predict_mc(
+            prompt=prompt,
+            response=response,
+            num_mc=num_mc,
+        )
+
+        # 3. Ensemble uncertainty
+        uncertainty = self.compute_uncertainty_from_samples(
+            reward_samples=reward_samples,
+            uncertainty_type=uncertainty_type,
+        )
+
+        # 4. Caution-style pessimistic score
+        pessimistic_score = (
+                reward
+                - pessimism_weight * uncertainty
+        )
+
+        return {
+            "reward": reward,
+            "uncertainty": uncertainty,
+            "pessimistic_score": pessimistic_score,
+        }
