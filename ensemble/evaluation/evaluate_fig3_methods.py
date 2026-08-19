@@ -1,9 +1,23 @@
-import os
-import csv
-import json
-import argparse
+#!/usr/bin/env python3
 
+import argparse
+import json
+import re
+from pathlib import Path
+
+import ijson
 import numpy as np
+import pandas as pd
+
+
+# ============================================================
+# Exact N grid used in the previous Figure 3 reproduction
+# ============================================================
+
+N_VALUES = [
+    1, 2, 4, 8, 16,
+    32, 64, 128, 256, 512,
+]
 
 
 SUPPORTED_METHODS = [
@@ -16,7 +30,7 @@ SUPPORTED_METHODS = [
 
 
 METHOD_DISPLAY_NAMES = {
-    "rm": "RM",
+    "rm": "Reward Model",
     "pessimism": "Pessimism",
     "caution": "RM + Pessimism",
     "neuboots_pessimism": "NeuBoots Pessimism",
@@ -24,14 +38,332 @@ METHOD_DISPLAY_NAMES = {
 }
 
 
-def load_jsonl_by_id(path):
+# ============================================================
+# Caution detailed candidate loader
+# ============================================================
+
+def candidate_key(value):
+    """
+    Preserve the candidate ordering used by the
+    previous Figure 3 reproduction code.
+    """
+
+    text = str(value)
+    numbers = re.findall(r"\d+", text)
+
+    if numbers:
+        return int(numbers[-1]), text
+
+    return 10**12, text
+
+
+def iter_top_level(path):
+    """
+    Stream either a top-level dictionary or list
+    without loading the entire detailed_candidates.json
+    into memory.
+    """
+
+    with open(path, "rb") as f:
+        first = f.read(1)
+
+        while first in {
+            b" ",
+            b"\n",
+            b"\r",
+            b"\t",
+        }:
+            first = f.read(1)
+
+        f.seek(0)
+
+        if first == b"{":
+            yield from ijson.kvitems(
+                f,
+                "",
+            )
+
+        elif first == b"[":
+            for i, item in enumerate(
+                ijson.items(
+                    f,
+                    "item",
+                )
+            ):
+                yield str(i), item
+
+        else:
+            raise ValueError(
+                f"Unsupported JSON root: {path}"
+            )
+
+
+def to_accuracy(value):
+    if isinstance(
+        value,
+        (bool, np.bool_),
+    ):
+        return float(value)
+
+    if isinstance(
+        value,
+        (int, float),
+    ):
+        return float(value)
+
+    if isinstance(value, str):
+        value = (
+            value
+            .strip()
+            .lower()
+        )
+
+        if value in {
+            "true",
+            "correct",
+        }:
+            return 1.0
+
+        if value in {
+            "false",
+            "incorrect",
+        }:
+            return 0.0
+
+        return float(value)
+
+    raise TypeError(
+        f"Unsupported accuracy value: {value}"
+    )
+
+
+def load_caution_dataset(path):
+    """
+    Load exactly the same three candidate-level
+    quantities used by the previous Figure 3 code:
+
+        accuracy
+        reward_model_score
+        rnd_score
+
+    Returned arrays have shape:
+
+        [num_problems, num_candidates]
+    """
+
+    problem_ids = []
+
+    accuracy_rows = []
+    rm_rows = []
+    rnd_rows = []
+
+    candidate_counts = []
+
+    print(
+        f"Reading Caution candidates: {path}"
+    )
+
+    for problem_idx, (
+        problem_id,
+        problem,
+    ) in enumerate(
+        iter_top_level(path),
+        start=1,
+    ):
+        responses = problem["responses"]
+
+        if isinstance(
+            responses,
+            dict,
+        ):
+            candidates = [
+                responses[key]
+                for key in sorted(
+                    responses,
+                    key=candidate_key,
+                )
+            ]
+        else:
+            candidates = responses
+
+        accuracy_values = []
+        rm_values = []
+        rnd_values = []
+
+        for candidate in candidates:
+
+            scores = candidate.get(
+                "reward_scores",
+                {},
+            )
+
+            rm = scores.get(
+                "reward_model_score",
+                candidate.get(
+                    "reward_model_score"
+                ),
+            )
+
+            rnd = scores.get(
+                "rnd_score",
+                candidate.get(
+                    "rnd_score"
+                ),
+            )
+
+            accuracy = candidate.get(
+                "accuracy",
+                candidate.get(
+                    "correct",
+                    candidate.get(
+                        "is_correct"
+                    ),
+                ),
+            )
+
+            if (
+                rm is None
+                or rnd is None
+                or accuracy is None
+            ):
+                raise RuntimeError(
+                    "Missing RM / RND / accuracy "
+                    f"field in problem {problem_idx}"
+                )
+
+            rm_values.append(
+                float(rm)
+            )
+
+            rnd_values.append(
+                float(rnd)
+            )
+
+            accuracy_values.append(
+                to_accuracy(
+                    accuracy
+                )
+            )
+
+        problem_ids.append(
+            str(problem_id)
+        )
+
+        candidate_counts.append(
+            len(candidates)
+        )
+
+        rm_rows.append(
+            np.asarray(
+                rm_values,
+                dtype=np.float64,
+            )
+        )
+
+        rnd_rows.append(
+            np.asarray(
+                rnd_values,
+                dtype=np.float64,
+            )
+        )
+
+        accuracy_rows.append(
+            np.asarray(
+                accuracy_values,
+                dtype=np.float64,
+            )
+        )
+
+        if problem_idx % 100 == 0:
+            print(
+                f"  loaded {problem_idx} problems"
+            )
+
+    if not candidate_counts:
+        raise RuntimeError(
+            "No problems were loaded."
+        )
+
+    min_candidates = min(
+        candidate_counts
+    )
+
+    if len(
+        set(candidate_counts)
+    ) != 1:
+        print(
+            "Warning: candidate counts differ. "
+            f"Truncating all problems to "
+            f"{min_candidates} candidates."
+        )
+
+    accuracy = np.stack(
+        [
+            row[:min_candidates]
+            for row in accuracy_rows
+        ]
+    )
+
+    rm = np.stack(
+        [
+            row[:min_candidates]
+            for row in rm_rows
+        ]
+    )
+
+    rnd = np.stack(
+        [
+            row[:min_candidates]
+            for row in rnd_rows
+        ]
+    )
+
+    print(
+        f"Problems={accuracy.shape[0]}, "
+        f"Candidates={accuracy.shape[1]}"
+    )
+
+    return (
+        problem_ids,
+        accuracy,
+        rm,
+        rnd,
+    )
+
+
+# ============================================================
+# NeuBoots result loader
+# ============================================================
+
+def load_neuboots_results(
+        path,
+        problem_ids,
+        num_candidates,
+):
+    """
+    Load NeuBoots candidate uncertainty.
+
+    Expected JSONL fields:
+
+        instance_id
+        all_neuboots_uncertainty
+
+    Candidate ordering must be the same as
+    the original Caution generation.
+    """
+
     data = {}
+
+    print(
+        f"Reading NeuBoots scores: {path}"
+    )
 
     with open(
         path,
         "r",
         encoding="utf-8",
     ) as f:
+
         for line in f:
             line = line.strip()
 
@@ -39,20 +371,269 @@ def load_jsonl_by_id(path):
                 continue
 
             item = json.loads(line)
-            instance_id = item["instance_id"]
+
+            instance_id = str(
+                item["instance_id"]
+            )
 
             if instance_id in data:
                 raise ValueError(
-                    f"Duplicate instance_id: {instance_id}"
+                    "Duplicate NeuBoots "
+                    f"instance_id: {instance_id}"
                 )
 
-            data[instance_id] = item
+            data[instance_id] = np.asarray(
+                item[
+                    "all_neuboots_uncertainty"
+                ],
+                dtype=np.float64,
+            )
 
-    return data
+    caution_ids = set(
+        problem_ids
+    )
+
+    neuboots_ids = set(
+        data
+    )
+
+    if caution_ids != neuboots_ids:
+
+        missing = (
+            caution_ids
+            - neuboots_ids
+        )
+
+        extra = (
+            neuboots_ids
+            - caution_ids
+        )
+
+        print(
+            "\nCaution / NeuBoots IDs "
+            "do not match."
+        )
+
+        print(
+            f"Missing NeuBoots IDs: "
+            f"{len(missing)}"
+        )
+
+        print(
+            f"Extra NeuBoots IDs: "
+            f"{len(extra)}"
+        )
+
+        if missing:
+            print(
+                "Example missing IDs:",
+                list(missing)[:5],
+            )
+
+        if extra:
+            print(
+                "Example extra IDs:",
+                list(extra)[:5],
+            )
+
+        raise ValueError(
+            "Cannot safely align "
+            "NeuBoots candidates."
+        )
+
+    rows = []
+
+    for problem_id in problem_ids:
+
+        uncertainty = data[
+            problem_id
+        ]
+
+        if len(
+            uncertainty
+        ) < num_candidates:
+            raise ValueError(
+                f"{problem_id}: "
+                "NeuBoots has only "
+                f"{len(uncertainty)} candidates, "
+                f"expected at least "
+                f"{num_candidates}."
+            )
+
+        rows.append(
+            uncertainty[
+                :num_candidates
+            ]
+        )
+
+    uncertainty = np.stack(
+        rows
+    )
+
+    print(
+        "NeuBoots uncertainty shape="
+        f"{uncertainty.shape}"
+    )
+
+    return uncertainty
 
 
-def method_requires_neuboots(methods):
-    return any(
+# ============================================================
+# Normalization
+# ============================================================
+
+def global_zscore(
+        values,
+        name,
+):
+    """
+    IMPORTANT:
+
+    This exactly follows the previous
+    Figure 3 reproduction:
+
+        values.mean()
+        values.std()
+
+    on the full [problem, candidate] matrix.
+
+    Therefore normalization is GLOBAL over
+    all problem-candidate pairs in a dataset,
+    not per-problem.
+    """
+
+    mean = float(
+        values.mean()
+    )
+
+    std = float(
+        values.std()
+    )
+
+    if std == 0.0:
+        raise ValueError(
+            f"{name} has zero standard deviation."
+        )
+
+    normalized = (
+        values - mean
+    ) / std
+
+    return (
+        normalized,
+        mean,
+        std,
+    )
+
+
+# ============================================================
+# Bootstrap
+# ============================================================
+
+def bootstrap_ci(
+        values,
+        num_bootstrap=1000,
+        seed=42,
+):
+    """
+    Same bootstrap implementation used by
+    the previous Figure 3 reproduction.
+    """
+
+    rng = np.random.default_rng(
+        seed
+    )
+
+    n = len(values)
+
+    indices = rng.integers(
+        0,
+        n,
+        size=(
+            num_bootstrap,
+            n,
+        ),
+    )
+
+    means = (
+        values[indices]
+        .mean(axis=1)
+    )
+
+    low, high = np.quantile(
+        means,
+        [
+            0.025,
+            0.975,
+        ],
+    )
+
+    return (
+        float(low),
+        float(high),
+    )
+
+
+# ============================================================
+# Score construction
+# ============================================================
+
+def build_method_scores(
+        methods,
+        rm,
+        rnd,
+        neuboots_uncertainty=None,
+        caution_lambda=0.8,
+        neuboots_lambda=0.8,
+):
+    """
+    Previous Figure 3 definitions:
+
+        RM:
+            z(RM)
+
+        Pessimism:
+            z(RND)
+
+        RM + Pessimism:
+            (1-lambda) * z(RM)
+            + lambda * z(RND)
+
+    NeuBoots extension:
+
+        NB pessimism score:
+            - uncertainty
+
+        NeuBoots Pessimism:
+            z(- uncertainty)
+
+        RM + NeuBoots:
+            (1-lambda_NB) * z(RM)
+            + lambda_NB * z(- uncertainty)
+    """
+
+    scores = {}
+
+    normalization = {}
+
+    need_rm = any(
+        method in methods
+        for method in [
+            "rm",
+            "caution",
+            "rm_neuboots",
+        ]
+    )
+
+    need_rnd = any(
+        method in methods
+        for method in [
+            "pessimism",
+            "caution",
+        ]
+    )
+
+    need_neuboots = any(
         method in methods
         for method in [
             "neuboots_pessimism",
@@ -60,596 +641,470 @@ def method_requires_neuboots(methods):
         ]
     )
 
+    z_rm = None
+    z_rnd = None
+    z_neuboots = None
 
-def running_selection(
-        scores,
-        accuracy,
-):
-    """
-    For N = 1, ..., num_candidates:
+    if need_rm:
 
-    Among the first N candidates,
-    select the candidate with the highest score
-    and record whether that candidate is correct.
-    """
-
-    if len(scores) == 0:
-        raise ValueError(
-            "scores must contain at least one candidate"
+        (
+            z_rm,
+            rm_mean,
+            rm_std,
+        ) = global_zscore(
+            rm,
+            "RM score",
         )
 
-    if len(scores) != len(accuracy):
-        raise ValueError(
-            "scores and accuracy length mismatch"
+        normalization["rm"] = {
+            "mean": rm_mean,
+            "std": rm_std,
+        }
+
+    if need_rnd:
+
+        (
+            z_rnd,
+            rnd_mean,
+            rnd_std,
+        ) = global_zscore(
+            rnd,
+            "RND score",
         )
 
-    selected_accuracy = np.zeros(
-        len(scores),
-        dtype=np.int64,
-    )
+        normalization["rnd"] = {
+            "mean": rnd_mean,
+            "std": rnd_std,
+        }
 
-    best_index = 0
-    best_score = scores[0]
+    if need_neuboots:
 
-    selected_accuracy[0] = int(
-        bool(accuracy[0])
-    )
-
-    for i in range(
-        1,
-        len(scores),
-    ):
-        if scores[i] > best_score:
-            best_score = scores[i]
-            best_index = i
-
-        selected_accuracy[i] = int(
-            bool(
-                accuracy[best_index]
-            )
-        )
-
-    return selected_accuracy
-
-
-def compute_summary(accuracy):
-    """
-    Compute Figure 3 summary statistics.
-
-    Peak:
-        maximum accuracy across N.
-
-    Final:
-        accuracy at maximum available N.
-
-    Degradation:
-        Peak - Final.
-    """
-
-    accuracy = np.asarray(
-        accuracy,
-        dtype=float,
-    )
-
-    peak_index = int(
-        np.argmax(accuracy)
-    )
-
-    peak_n = peak_index + 1
-
-    peak_accuracy = float(
-        accuracy[peak_index]
-    )
-
-    final_n = len(accuracy)
-
-    final_accuracy = float(
-        accuracy[-1]
-    )
-
-    degradation = (
-        peak_accuracy
-        - final_accuracy
-    )
-
-    return {
-        "peak_n": peak_n,
-        "peak_accuracy": peak_accuracy,
-        "final_n": final_n,
-        "final_accuracy": final_accuracy,
-        "degradation": degradation,
-    }
-
-
-def build_method_scores(
-        method,
-        caution_item,
-        neuboots_item=None,
-        neuboots_weight=0.8,
-):
-    """
-    Construct candidate selection scores.
-
-    rm:
-        raw RM reward
-
-    pessimism:
-        original Caution RND pessimism score.
-        Larger score means less uncertainty / more preferred.
-
-    caution:
-        original stored RM + Pessimism combined score.
-
-    neuboots_pessimism:
-        - NeuBoots uncertainty.
-        Since selection uses argmax,
-        this selects minimum-uncertainty candidates.
-
-    rm_neuboots:
-        RM reward - lambda * NeuBoots uncertainty.
-    """
-
-    details = caution_item[
-        "all_detailed_scores"
-    ]
-
-    raw_reward = np.asarray(
-        [
-            item["reward_score"]
-            for item in details
-        ],
-        dtype=float,
-    )
-
-    if method == "rm":
-        return raw_reward
-
-    if method == "pessimism":
-        return np.asarray(
-            [
-                item["rnd_score"]
-                for item in details
-            ],
-            dtype=float,
-        )
-
-    if method == "caution":
-        return np.asarray(
-            [
-                item["combined_score"]
-                for item in details
-            ],
-            dtype=float,
-        )
-
-    if method in [
-        "neuboots_pessimism",
-        "rm_neuboots",
-    ]:
-        if neuboots_item is None:
+        if neuboots_uncertainty is None:
             raise ValueError(
-                "NeuBoots method requires "
-                "--neuboots-results"
+                "NeuBoots uncertainty is required "
+                "for selected NeuBoots methods."
             )
 
-        uncertainty = np.asarray(
-            neuboots_item[
-                "all_neuboots_uncertainty"
-            ],
-            dtype=float,
+        # Lower uncertainty is better.
+        # Convert it into a score for argmax.
+        neuboots_pessimism = (
+            -neuboots_uncertainty
         )
 
-        if len(raw_reward) != len(
-            uncertainty
+        (
+            z_neuboots,
+            nb_mean,
+            nb_std,
+        ) = global_zscore(
+            neuboots_pessimism,
+            "NeuBoots pessimism score",
+        )
+
+        normalization[
+            "neuboots_pessimism"
+        ] = {
+            "mean": nb_mean,
+            "std": nb_std,
+        }
+
+    for method in methods:
+
+        if method == "rm":
+            scores[method] = z_rm
+
+        elif method == "pessimism":
+            scores[method] = z_rnd
+
+        elif method == "caution":
+            scores[method] = (
+                (
+                    1.0
+                    - caution_lambda
+                )
+                * z_rm
+                + caution_lambda
+                * z_rnd
+            )
+
+        elif (
+            method
+            == "neuboots_pessimism"
         ):
+            scores[method] = (
+                z_neuboots
+            )
+
+        elif method == "rm_neuboots":
+            scores[method] = (
+                (
+                    1.0
+                    - neuboots_lambda
+                )
+                * z_rm
+                + neuboots_lambda
+                * z_neuboots
+            )
+
+        else:
             raise ValueError(
-                "Reward / NeuBoots uncertainty "
-                "length mismatch"
+                f"Unsupported method: {method}"
             )
 
-        if method == "neuboots_pessimism":
-            return -uncertainty
-
-        if method == "rm_neuboots":
-            return (
-                raw_reward
-                - neuboots_weight
-                * uncertainty
-            )
-
-    raise ValueError(
-        f"Unsupported method: {method}"
+    return (
+        scores,
+        normalization,
     )
 
 
-def evaluate(
-        caution_data,
-        methods,
-        neuboots_data=None,
-        neuboots_weight=0.8,
+# ============================================================
+# Evaluation
+# ============================================================
+
+def evaluate_methods(
+        dataset_name,
+        accuracy,
+        method_scores,
+        n_values,
+        num_bootstrap=1000,
+        bootstrap_seed=42,
 ):
     """
-    Evaluate all selected methods over
-    N = 1, ..., num_candidates.
+    Evaluate only the specified N grid.
+
+    This intentionally does NOT evaluate
+    every N from 1 to 512.
     """
 
-    num_candidates = None
+    rows = []
 
-    correct_counts = {
-        method: None
-        for method in methods
-    }
-
-    use_neuboots = (
-        method_requires_neuboots(
-            methods
-        )
+    problem_idx = np.arange(
+        accuracy.shape[0]
     )
 
     for (
-        instance_id,
-        caution_item,
-    ) in caution_data.items():
+        method,
+        scores,
+    ) in method_scores.items():
 
-        accuracy = np.asarray(
-            caution_item[
-                "all_accuracy"
-            ],
-            dtype=bool,
-        )
+        for n in n_values:
 
-        if num_candidates is None:
-            num_candidates = len(
-                accuracy
+            if n > scores.shape[1]:
+                continue
+
+            candidate_scores = (
+                scores[:, :n]
             )
 
-            for method in methods:
-                correct_counts[
-                    method
-                ] = np.zeros(
-                    num_candidates,
-                    dtype=np.int64,
-                )
-
-        elif len(accuracy) != (
-            num_candidates
-        ):
-            raise ValueError(
-                f"{instance_id}: "
-                f"expected {num_candidates} candidates, "
-                f"got {len(accuracy)}"
+            selected_idx = np.argmax(
+                candidate_scores,
+                axis=1,
             )
 
-        neuboots_item = None
-
-        if use_neuboots:
-            if neuboots_data is None:
-                raise ValueError(
-                    "NeuBoots data is missing"
-                )
-
-            if instance_id not in (
-                neuboots_data
-            ):
-                raise ValueError(
-                    f"Missing NeuBoots result "
-                    f"for instance_id={instance_id}"
-                )
-
-            neuboots_item = (
-                neuboots_data[
-                    instance_id
+            selected_accuracy = (
+                accuracy[
+                    problem_idx,
+                    selected_idx,
                 ]
             )
 
-        for method in methods:
+            mean_accuracy = float(
+                selected_accuracy.mean()
+            )
 
-            scores = build_method_scores(
-                method=method,
-                caution_item=caution_item,
-                neuboots_item=(
-                    neuboots_item
+            (
+                ci_low,
+                ci_high,
+            ) = bootstrap_ci(
+                selected_accuracy,
+                num_bootstrap=(
+                    num_bootstrap
                 ),
-                neuboots_weight=(
-                    neuboots_weight
+                seed=(
+                    bootstrap_seed
                 ),
             )
 
-            if len(scores) != (
-                num_candidates
-            ):
-                raise ValueError(
-                    f"{instance_id}: "
-                    f"{method} score length "
-                    f"is {len(scores)}, "
-                    f"expected {num_candidates}"
-                )
+            rows.append(
+                {
+                    "dataset":
+                        dataset_name,
 
-            selected = (
-                running_selection(
-                    scores=scores,
-                    accuracy=accuracy,
-                )
-            )
-
-            correct_counts[
-                method
-            ] += selected
-
-    num_problems = len(
-        caution_data
-    )
-
-    if num_problems == 0:
-        raise ValueError(
-            "No problems found in input data"
-        )
-
-    accuracy_by_method = {}
-
-    for method in methods:
-        accuracy_by_method[
-            method
-        ] = (
-            correct_counts[method]
-            / num_problems
-        )
-
-    return (
-        accuracy_by_method,
-        num_problems,
-        num_candidates,
-    )
-
-
-def get_method_weight(
-        method,
-        neuboots_weight,
-):
-    """
-    Only RM + NeuBoots explicitly uses
-    the CLI NeuBoots lambda.
-
-    Original Caution combined_score is
-    already stored in the reference result,
-    so its weight is not recomputed here.
-    """
-
-    if method == "rm_neuboots":
-        return neuboots_weight
-
-    return ""
-
-
-def save_curves_csv(
-        path,
-        dataset,
-        accuracy_by_method,
-        neuboots_weight,
-):
-    """
-    Long-format Figure 3 curve data.
-
-    One row:
-        dataset / method / N / accuracy
-    """
-
-    with open(
-        path,
-        "w",
-        newline="",
-        encoding="utf-8",
-    ) as f:
-
-        writer = csv.writer(f)
-
-        writer.writerow(
-            [
-                "dataset",
-                "method",
-                "method_display_name",
-                "method_weight",
-                "n",
-                "accuracy",
-            ]
-        )
-
-        for (
-            method,
-            accuracy,
-        ) in accuracy_by_method.items():
-
-            method_weight = (
-                get_method_weight(
-                    method=method,
-                    neuboots_weight=(
-                        neuboots_weight
-                    ),
-                )
-            )
-
-            for index, value in enumerate(
-                accuracy
-            ):
-                writer.writerow(
-                    [
-                        dataset,
+                    "method":
                         method,
+
+                    "method_display_name":
                         METHOD_DISPLAY_NAMES[
                             method
                         ],
-                        method_weight,
-                        index + 1,
-                        float(value),
-                    ]
-                )
+
+                    "N":
+                        int(n),
+
+                    "accuracy":
+                        mean_accuracy,
+
+                    "accuracy_percent":
+                        mean_accuracy
+                        * 100.0,
+
+                    "ci_low":
+                        ci_low
+                        * 100.0,
+
+                    "ci_high":
+                        ci_high
+                        * 100.0,
+                }
+            )
+
+    return rows
 
 
-def save_summary_csv(
-        path,
-        dataset,
-        summaries,
-        num_problems,
-        num_candidates,
-        neuboots_weight,
+def build_summary(
+        curve_df,
+        caution_lambda,
+        neuboots_lambda,
 ):
     """
-    Table-oriented summary.
-
-    One row per method.
+    Peak is computed ONLY over the evaluated
+    N grid, exactly like the previous
+    reproduction workflow.
     """
 
-    with open(
-        path,
-        "w",
-        newline="",
-        encoding="utf-8",
-    ) as f:
+    rows = []
 
-        writer = csv.writer(f)
+    method_order = (
+        curve_df[
+            "method"
+        ]
+        .drop_duplicates()
+        .tolist()
+    )
 
-        writer.writerow(
-            [
-                "dataset",
-                "method",
-                "method_display_name",
-                "method_weight",
-                "num_problems",
-                "num_candidates",
-                "peak_n",
-                "peak_accuracy",
-                "final_n",
-                "final_accuracy",
-                "degradation",
+    for method in method_order:
+
+        subset = (
+            curve_df[
+                curve_df["method"]
+                == method
+            ]
+            .sort_values("N")
+            .reset_index(drop=True)
+        )
+
+        peak_idx = int(
+            subset[
+                "accuracy"
+            ].idxmax()
+        )
+
+        peak_row = (
+            subset.loc[
+                peak_idx
             ]
         )
 
-        for (
-            method,
-            summary,
-        ) in summaries.items():
+        final_row = (
+            subset.iloc[-1]
+        )
 
+        degradation = (
+            float(
+                peak_row[
+                    "accuracy"
+                ]
+            )
+            - float(
+                final_row[
+                    "accuracy"
+                ]
+            )
+        )
+
+        if method == "caution":
             method_weight = (
-                get_method_weight(
-                    method=method,
-                    neuboots_weight=(
-                        neuboots_weight
-                    ),
-                )
+                caution_lambda
             )
 
-            writer.writerow(
-                [
-                    dataset,
+        elif method == "rm_neuboots":
+            method_weight = (
+                neuboots_lambda
+            )
+
+        else:
+            method_weight = ""
+
+        rows.append(
+            {
+                "dataset":
+                    peak_row[
+                        "dataset"
+                    ],
+
+                "method":
                     method,
+
+                "method_display_name":
                     METHOD_DISPLAY_NAMES[
                         method
                     ],
-                    method_weight,
-                    num_problems,
-                    num_candidates,
-                    summary[
-                        "peak_n"
-                    ],
-                    summary[
-                        "peak_accuracy"
-                    ],
-                    summary[
-                        "final_n"
-                    ],
-                    summary[
-                        "final_accuracy"
-                    ],
-                    summary[
-                        "degradation"
-                    ],
-                ]
-            )
 
+                "method_weight":
+                    method_weight,
+
+                "peak_n":
+                    int(
+                        peak_row["N"]
+                    ),
+
+                "peak_accuracy":
+                    float(
+                        peak_row[
+                            "accuracy"
+                        ]
+                    ),
+
+                "peak_accuracy_percent":
+                    float(
+                        peak_row[
+                            "accuracy_percent"
+                        ]
+                    ),
+
+                "peak_ci_low":
+                    float(
+                        peak_row[
+                            "ci_low"
+                        ]
+                    ),
+
+                "peak_ci_high":
+                    float(
+                        peak_row[
+                            "ci_high"
+                        ]
+                    ),
+
+                "final_n":
+                    int(
+                        final_row["N"]
+                    ),
+
+                "final_accuracy":
+                    float(
+                        final_row[
+                            "accuracy"
+                        ]
+                    ),
+
+                "final_accuracy_percent":
+                    float(
+                        final_row[
+                            "accuracy_percent"
+                        ]
+                    ),
+
+                "final_ci_low":
+                    float(
+                        final_row[
+                            "ci_low"
+                        ]
+                    ),
+
+                "final_ci_high":
+                    float(
+                        final_row[
+                            "ci_high"
+                        ]
+                    ),
+
+                "degradation":
+                    degradation,
+
+                "degradation_percent":
+                    degradation
+                    * 100.0,
+            }
+        )
+
+    return pd.DataFrame(
+        rows
+    )
+
+
+# ============================================================
+# Printing
+# ============================================================
 
 def print_summary(
-        dataset,
-        summaries,
+        summary_df,
 ):
     print()
-    print(
-        "=" * 88
-    )
+    print("=" * 96)
 
     print(
-        f"Figure 3 evaluation: "
-        f"{dataset}"
+        "Figure 3 reproduction summary"
     )
 
-    print(
-        "=" * 88
-    )
+    print("=" * 96)
 
     print(
-        f"{'Method':<26}"
-        f"{'Peak':>12}"
+        f"{'Method':<28}"
+        f"{'Peak':>10}"
         f"{'Peak N':>10}"
-        f"{'Final':>12}"
-        f"{'Degradation':>16}"
+        f"{'Final':>10}"
+        f"{'Final N':>10}"
+        f"{'Deg.':>10}"
     )
 
-    print(
-        "-" * 88
-    )
+    print("-" * 96)
 
-    for (
-        method,
-        summary,
-    ) in summaries.items():
-
-        display_name = (
-            METHOD_DISPLAY_NAMES[
-                method
-            ]
-        )
+    for _, row in (
+        summary_df.iterrows()
+    ):
 
         print(
-            f"{display_name:<26}"
-            f"{summary['peak_accuracy']:>12.3f}"
-            f"{summary['peak_n']:>10d}"
-            f"{summary['final_accuracy']:>12.3f}"
-            f"{summary['degradation']:>16.3f}"
+            f"{row['method_display_name']:<28}"
+            f"{row['peak_accuracy_percent']:>9.1f}%"
+            f"{int(row['peak_n']):>10d}"
+            f"{row['final_accuracy_percent']:>9.1f}%"
+            f"{int(row['final_n']):>10d}"
+            f"{row['degradation_percent']:>9.1f}"
         )
 
-    print(
-        "=" * 88
-    )
+    print("=" * 96)
 
+
+# ============================================================
+# Main
+# ============================================================
 
 def main():
+
     parser = argparse.ArgumentParser()
 
     parser.add_argument(
         "--dataset",
-        type=str,
         required=True,
-        help=(
-            "Dataset name stored in output "
-            "metadata, e.g. gsm8k, math500, bbh."
-        ),
+        type=str,
     )
 
     parser.add_argument(
-        "--caution-results",
-        type=str,
+        "--caution-detailed",
         required=True,
+        type=Path,
         help=(
-            "Original Caution results.jsonl."
+            "Original Caution "
+            "detailed_candidates.json"
         ),
     )
 
     parser.add_argument(
         "--neuboots-results",
-        type=str,
+        type=Path,
         default=None,
         help=(
-            "NeuBoots candidate scoring "
-            "results.jsonl."
+            "NeuBoots scored_candidates.jsonl"
         ),
     )
 
@@ -662,33 +1117,46 @@ def main():
             "pessimism",
             "caution",
         ],
-        help=(
-            "Methods to evaluate."
-        ),
     )
 
     parser.add_argument(
-        "--neuboots-weight",
+        "--caution-lambda",
         type=float,
         default=0.8,
-        help=(
-            "Lambda used for "
-            "RM + NeuBoots."
-        ),
+    )
+
+    parser.add_argument(
+        "--neuboots-lambda",
+        type=float,
+        default=0.8,
+    )
+
+    parser.add_argument(
+        "--num-bootstrap",
+        type=int,
+        default=1000,
+    )
+
+    parser.add_argument(
+        "--bootstrap-seed",
+        type=int,
+        default=42,
     )
 
     parser.add_argument(
         "--output-dir",
-        type=str,
+        type=Path,
         required=True,
     )
 
     args = parser.parse_args()
 
-    use_neuboots = (
-        method_requires_neuboots(
-            args.methods
-        )
+    use_neuboots = any(
+        method in args.methods
+        for method in [
+            "neuboots_pessimism",
+            "rm_neuboots",
+        ]
     )
 
     if (
@@ -698,89 +1166,133 @@ def main():
     ):
         raise ValueError(
             "--neuboots-results is required "
-            "when using "
-            "neuboots_pessimism or "
-            "rm_neuboots"
+            "when using a NeuBoots method."
         )
 
-    os.makedirs(
-        args.output_dir,
+    args.output_dir.mkdir(
+        parents=True,
         exist_ok=True,
     )
 
-    caution_data = (
-        load_jsonl_by_id(
-            args.caution_results
-        )
+    (
+        problem_ids,
+        accuracy,
+        rm,
+        rnd,
+    ) = load_caution_dataset(
+        args.caution_detailed
     )
 
-    neuboots_data = None
+    neuboots_uncertainty = None
 
     if use_neuboots:
-        neuboots_data = (
-            load_jsonl_by_id(
-                args.neuboots_results
+
+        neuboots_uncertainty = (
+            load_neuboots_results(
+                path=(
+                    args.neuboots_results
+                ),
+                problem_ids=problem_ids,
+                num_candidates=(
+                    accuracy.shape[1]
+                ),
             )
         )
-
-        caution_ids = set(
-            caution_data
-        )
-
-        neuboots_ids = set(
-            neuboots_data
-        )
-
-        if caution_ids != (
-            neuboots_ids
-        ):
-            missing_neuboots = (
-                caution_ids
-                - neuboots_ids
-            )
-
-            extra_neuboots = (
-                neuboots_ids
-                - caution_ids
-            )
-
-            raise ValueError(
-                "Caution / NeuBoots "
-                "instance IDs do not match.\n"
-                f"Missing NeuBoots IDs: "
-                f"{len(missing_neuboots)}\n"
-                f"Extra NeuBoots IDs: "
-                f"{len(extra_neuboots)}"
-            )
 
     (
-        accuracy_by_method,
-        num_problems,
-        num_candidates,
-    ) = evaluate(
-        caution_data=caution_data,
+        method_scores,
+        normalization,
+    ) = build_method_scores(
         methods=args.methods,
-        neuboots_data=(
-            neuboots_data
+        rm=rm,
+        rnd=rnd,
+        neuboots_uncertainty=(
+            neuboots_uncertainty
         ),
-        neuboots_weight=(
-            args.neuboots_weight
+        caution_lambda=(
+            args.caution_lambda
+        ),
+        neuboots_lambda=(
+            args.neuboots_lambda
         ),
     )
 
-    summaries = {
-        method: compute_summary(
-            accuracy
-        )
-        for (
-            method,
-            accuracy,
-        ) in accuracy_by_method.items()
-    }
+    valid_n_values = [
+        n
+        for n in N_VALUES
+        if n <= accuracy.shape[1]
+    ]
+
+    rows = evaluate_methods(
+        dataset_name=args.dataset,
+        accuracy=accuracy,
+        method_scores=(
+            method_scores
+        ),
+        n_values=(
+            valid_n_values
+        ),
+        num_bootstrap=(
+            args.num_bootstrap
+        ),
+        bootstrap_seed=(
+            args.bootstrap_seed
+        ),
+    )
+
+    curve_df = pd.DataFrame(
+        rows
+    )
+
+    summary_df = build_summary(
+        curve_df=curve_df,
+        caution_lambda=(
+            args.caution_lambda
+        ),
+        neuboots_lambda=(
+            args.neuboots_lambda
+        ),
+    )
+
+    # ----------------------------------------
+    # Save curve CSV
+    # ----------------------------------------
+
+    curve_path = (
+        args.output_dir
+        / "curves.csv"
+    )
+
+    curve_df.to_csv(
+        curve_path,
+        index=False,
+    )
+
+    # ----------------------------------------
+    # Save summary CSV
+    # ----------------------------------------
+
+    summary_path = (
+        args.output_dir
+        / "summary.csv"
+    )
+
+    summary_df.to_csv(
+        summary_path,
+        index=False,
+    )
+
+    # ----------------------------------------
+    # Save metadata / full result JSON
+    # ----------------------------------------
 
     result = {
-        "dataset": args.dataset,
-        "methods": args.methods,
+        "dataset":
+            args.dataset,
+
+        "methods":
+            args.methods,
+
         "method_display_names": {
             method:
                 METHOD_DISPLAY_NAMES[
@@ -788,46 +1300,56 @@ def main():
                 ]
             for method in args.methods
         },
-        "num_problems": (
-            num_problems
-        ),
-        "num_candidates": (
-            num_candidates
-        ),
-        "neuboots_weight": (
-            args.neuboots_weight
-        ),
-        "summary": summaries,
-        "accuracy_by_n": {
-            method: {
-                str(index + 1):
-                    float(
-                        accuracy[index]
-                    )
-                for index in range(
-                    len(accuracy)
+
+        "num_problems":
+            int(
+                accuracy.shape[0]
+            ),
+
+        "num_candidates":
+            int(
+                accuracy.shape[1]
+            ),
+
+        "n_values":
+            valid_n_values,
+
+        "caution_lambda":
+            args.caution_lambda,
+
+        "neuboots_lambda":
+            args.neuboots_lambda,
+
+        "normalization_scope":
+            "global_dataset_problem_candidate",
+
+        "normalization":
+            normalization,
+
+        "num_bootstrap":
+            args.num_bootstrap,
+
+        "bootstrap_seed":
+            args.bootstrap_seed,
+
+        "summary":
+            json.loads(
+                summary_df.to_json(
+                    orient="records"
                 )
-            }
-            for (
-                method,
-                accuracy,
-            ) in accuracy_by_method.items()
-        },
+            ),
+
+        "curves":
+            json.loads(
+                curve_df.to_json(
+                    orient="records"
+                )
+            ),
     }
 
-    json_path = os.path.join(
-        args.output_dir,
-        "results.json",
-    )
-
-    curves_path = os.path.join(
-        args.output_dir,
-        "curves.csv",
-    )
-
-    summary_path = os.path.join(
-        args.output_dir,
-        "summary.csv",
+    json_path = (
+        args.output_dir
+        / "results.json"
     )
 
     with open(
@@ -835,48 +1357,28 @@ def main():
         "w",
         encoding="utf-8",
     ) as f:
+
         json.dump(
             result,
             f,
             indent=2,
         )
 
-    save_curves_csv(
-        path=curves_path,
-        dataset=args.dataset,
-        accuracy_by_method=(
-            accuracy_by_method
-        ),
-        neuboots_weight=(
-            args.neuboots_weight
-        ),
-    )
-
-    save_summary_csv(
-        path=summary_path,
-        dataset=args.dataset,
-        summaries=summaries,
-        num_problems=num_problems,
-        num_candidates=num_candidates,
-        neuboots_weight=(
-            args.neuboots_weight
-        ),
-    )
-
     print_summary(
-        dataset=args.dataset,
-        summaries=summaries,
+        summary_df
     )
 
     print()
     print(
-        f"Saved JSON : {json_path}"
+        f"Saved curves : {curve_path}"
     )
+
     print(
-        f"Saved curve: {curves_path}"
+        f"Saved summary: {summary_path}"
     )
+
     print(
-        f"Saved table: {summary_path}"
+        f"Saved JSON   : {json_path}"
     )
 
 
