@@ -34,7 +34,6 @@ def create_bootstrap_groups(
 
     if remainder != 0:
         pad_size = n_a - remainder
-        indices = n_a - remainder
 
         indices = np.pad(
             indices,
@@ -159,7 +158,7 @@ class RewardValuePredictor(nn.Module):
             self.projection = None
             logger.info("No projection layer")
 
-        self.reward_head = nn.Linear(hidden_size, 1)
+        self.reward_head = NbsRewardHead(in_feat=hidden_size)
 
         logger.info(f"Created predictor: model_type={self.model_type}, exact_architecture={exact_architecture}, embedding_strategy={embedding_strategy}, layers={num_layers}, hidden_size={hidden_size}")
         logger.info(f"Added scalar reward_head layer")
@@ -298,7 +297,7 @@ class RewardValuePredictor(nn.Module):
             nn.init.ones_(module.weight)
             nn.init.zeros_(module.bias)
 
-    def forward(self, input_ids, attention_mask):
+    def forward(self, input_ids, attention_mask, alpha = None):
         """
         Predict the target network's output.
 
@@ -338,7 +337,7 @@ class RewardValuePredictor(nn.Module):
             hidden_states = self.projection(hidden_states)
 
         pooled_features = hidden_states[:, 0, :]
-        reward_pred = self.reward_head(pooled_features)
+        reward_pred = self.reward_head(pooled_features, alpha=alpha)
 
         return reward_pred.squeeze(-1)
 
@@ -469,7 +468,7 @@ class RewardValueModel:
             use_loss_noise: If True, adds Gaussian noise to residual before squaring
             loss_noise_std: Standard deviation of Gaussian noise (used  if use_loss_noise)
         """
-        logger.info(f"Training RND predictor on {len(prompts)} examples")
+        logger.info(f"Training NeuBoots reward predictor on {len(prompts)} examples")
 
         # Create dataset and dataloader
         group_indices = create_bootstrap_groups(
@@ -582,7 +581,7 @@ class RewardValueModel:
         # Save the trained models
         if save_path:
             os.makedirs(save_path, exist_ok=True)
-            torch.save(self.predictor_network.state_dict(), os.path.join(save_path, "rnd_predictor.pt"))
+            torch.save(self.predictor_network.state_dict(), os.path.join(save_path, "reward_predictor.pt"))
 
             # Save config
             config = {
