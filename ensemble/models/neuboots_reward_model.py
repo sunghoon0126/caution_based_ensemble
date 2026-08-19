@@ -637,26 +637,23 @@ class RewardValueModel:
             self,
             prompt: str,
             response: str,
+            num_mc: int = 20,
     ) -> Dict[str, float]:
 
-        inputs = self.tokenizer(
-            prompt,
-            response,
-            return_tensors="pt",
-            truncation=True,
-            max_length=512,
-        ).to(self.device)
+        target_reward = self.compute_reward_score(
+            prompt=prompt,
+            response=response,
+        )
 
-        self.predictor_network.eval()
+        reward_samples = self.predict_mc(
+            prompt=prompt,
+            response=response,
+            num_mc=num_mc,
+        )
 
-        outputs = self.reward_model(**inputs)
-
-        target_reward = outputs.logits.squeeze(-1).item()
-
-        predictor_reward = self.predictor_network(
-            inputs["input_ids"],
-            inputs["attention_mask"]
-        ).item()
+        predictor_reward = (
+            reward_samples.mean().item()
+        )
 
         error = abs(
             predictor_reward - target_reward

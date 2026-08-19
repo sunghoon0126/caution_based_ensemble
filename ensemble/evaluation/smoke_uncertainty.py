@@ -134,7 +134,7 @@ def main():
     if torch.cuda.is_available():
         torch.cuda.manual_seed_all(args.seed)
 
-    comparison = model.compare_reward(
+    target_reward = model.compute_reward_score(
         prompt=prompt,
         response=response,
     )
@@ -146,6 +146,10 @@ def main():
     )
 
     reward_mean = reward_samples.mean().item()
+
+    absolute_error = abs(
+        reward_mean - target_reward
+    )
 
     uncertainty_std = (
         model.compute_uncertainty_from_samples(
@@ -162,24 +166,24 @@ def main():
     )
 
     pessimistic_score = (
-        comparison["target_reward"]
-        - args.pessimism_weight
-        * uncertainty_std
+            target_reward
+            - args.pessimism_weight
+            * uncertainty_std
     )
 
     print()
     print("===== Reward comparison =====")
     print(
         f"Target RM reward     : "
-        f"{comparison['target_reward']:.6f}"
+        f"{target_reward:.6f}"
     )
     print(
-        f"Predictor reward     : "
-        f"{comparison['predictor_reward']:.6f}"
+        f"Predictor MC mean    : "
+        f"{reward_mean:.6f}"
     )
     print(
         f"Absolute error       : "
-        f"{comparison['absolute_error']:.6f}"
+        f"{absolute_error:.6f}"
     )
 
     print()
@@ -213,7 +217,7 @@ def main():
     print("===== Pessimistic score =====")
     print(
         f"Reward               : "
-        f"{comparison['target_reward']:.6f}"
+        f"{target_reward:.6f}"
     )
     print(
         f"Lambda               : "
