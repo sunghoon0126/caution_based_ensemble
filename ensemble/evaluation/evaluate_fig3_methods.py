@@ -9,9 +9,14 @@ import ijson
 import numpy as np
 import pandas as pd
 
+from ensemble.evaluation.normalization import (
+    load_normalization_stats,
+    normalize_with_stats,
+)
+
 
 # ============================================================
-# Exact N grid used in the previous Figure 3 reproduction
+# Figure 3 evaluation grid
 # ============================================================
 
 N_VALUES = [
@@ -31,8 +36,8 @@ SUPPORTED_METHODS = [
 
 METHOD_DISPLAY_NAMES = {
     "rm": "Reward Model",
-    "pessimism": "Pessimism",
-    "caution": "RM + Pessimism",
+    "pessimism": "RND Pessimism",
+    "caution": "RM + RND Pessimism",
     "neuboots_pessimism": "NeuBoots Pessimism",
     "rm_neuboots": "RM + NeuBoots",
 }
@@ -44,7 +49,7 @@ METHOD_DISPLAY_NAMES = {
 
 def candidate_key(value):
     """
-    Preserve the candidate ordering used by the
+    Preserve candidate ordering from the
     previous Figure 3 reproduction code.
     """
 
@@ -59,9 +64,7 @@ def candidate_key(value):
 
 def iter_top_level(path):
     """
-    Stream either a top-level dictionary or list
-    without loading the entire detailed_candidates.json
-    into memory.
+    Stream a top-level JSON dictionary or list.
     """
 
     with open(path, "rb") as f:
@@ -139,15 +142,18 @@ def to_accuracy(value):
 
 def load_caution_dataset(path):
     """
-    Load exactly the same three candidate-level
-    quantities used by the previous Figure 3 code:
+    Load candidate-level:
 
         accuracy
         reward_model_score
         rnd_score
 
-    Returned arrays have shape:
+    rnd_score in the stored Caution artifacts is
+    treated as a pessimism score:
 
+        rnd_score = - uncertainty
+
+    Arrays:
         [num_problems, num_candidates]
     """
 
@@ -293,8 +299,7 @@ def load_caution_dataset(path):
     ) != 1:
         print(
             "Warning: candidate counts differ. "
-            f"Truncating all problems to "
-            f"{min_candidates} candidates."
+            f"Truncating to {min_candidates}."
         )
 
     accuracy = np.stack(
@@ -343,13 +348,13 @@ def load_neuboots_results(
     """
     Load NeuBoots candidate uncertainty.
 
-    Expected JSONL fields:
+    Expected JSONL:
 
         instance_id
         all_neuboots_uncertainty
 
-    Candidate ordering must be the same as
-    the original Caution generation.
+    Candidate ordering must match the
+    Caution candidate ordering.
     """
 
     data = {}
@@ -409,8 +414,9 @@ def load_neuboots_results(
             - caution_ids
         )
 
+        print()
         print(
-            "\nCaution / NeuBoots IDs "
+            "Caution / NeuBoots IDs "
             "do not match."
         )
 
@@ -479,54 +485,6 @@ def load_neuboots_results(
 
 
 # ============================================================
-# Normalization
-# ============================================================
-
-def global_zscore(
-        values,
-        name,
-):
-    """
-    IMPORTANT:
-
-    This exactly follows the previous
-    Figure 3 reproduction:
-
-        values.mean()
-        values.std()
-
-    on the full [problem, candidate] matrix.
-
-    Therefore normalization is GLOBAL over
-    all problem-candidate pairs in a dataset,
-    not per-problem.
-    """
-
-    mean = float(
-        values.mean()
-    )
-
-    std = float(
-        values.std()
-    )
-
-    if std == 0.0:
-        raise ValueError(
-            f"{name} has zero standard deviation."
-        )
-
-    normalized = (
-        values - mean
-    ) / std
-
-    return (
-        normalized,
-        mean,
-        std,
-    )
-
-
-# ============================================================
 # Bootstrap
 # ============================================================
 
@@ -536,8 +494,7 @@ def bootstrap_ci(
         seed=42,
 ):
     """
-    Same bootstrap implementation used by
-    the previous Figure 3 reproduction.
+    Problem-level bootstrap confidence interval.
     """
 
     rng = np.random.default_rng(
@@ -575,55 +532,94 @@ def bootstrap_ci(
 
 
 # ============================================================
-# Score construction
+# Method score construction
 # ============================================================
 
 def build_method_scores(
         methods,
         rm,
         rnd,
+        normalization_stats,
         neuboots_uncertainty=None,
         caution_lambda=0.8,
         neuboots_lambda=0.8,
 ):
     """
-    Previous Figure 3 definitions:
+    Paper-style normalization.
 
-        RM:
-            z(RM)
+    IMPORTANT
+    ---------
+    Mean/std are NOT estimated from the current
+    evaluation dataset.
 
-        Pessimism:
-            z(RND)
+    They must already have been fitted on an
+    independent response set.
 
-        RM + Pessimism:
-            (1-lambda) * z(RM)
-            + lambda * z(RND)
+    Reward:
+        r_norm =
+            (r - mu_r_cal)
+            / sigma_r_cal
 
-    NeuBoots extension:
+    RND:
+        stored rnd_score = - uncertainty
 
-        NB pessimism score:
-            - uncertainty
+        u_rnd = -rnd_score
 
-        NeuBoots Pessimism:
-            z(- uncertainty)
+        u_rnd_norm =
+            (u_rnd - mu_rnd_cal)
+            / sigma_rnd_cal
 
-        RM + NeuBoots:
-            (1-lambda_NB) * z(RM)
-            + lambda_NB * z(- uncertainty)
+    NeuBoots:
+        u_nb_norm =
+            (u_nb - mu_nb_cal)
+            / sigma_nb_cal
+
+
+    Method definitions
+    ------------------
+
+    RM:
+        r_norm
+
+    RND Pessimism:
+        -u_rnd_norm
+
+    RM + RND:
+        r_norm
+        - lambda_RND * u_rnd_norm
+
+    NeuBoots Pessimism:
+        -u_nb_norm
+
+    RM + NeuBoots:
+        r_norm
+        - lambda_NB * u_nb_norm
     """
 
     scores = {}
 
-    normalization = {}
+    # --------------------------------------------------------
+    # Reward normalization
+    # --------------------------------------------------------
 
-    need_rm = any(
-        method in methods
-        for method in [
-            "rm",
-            "caution",
-            "rm_neuboots",
-        ]
+    if "reward" not in normalization_stats:
+        raise ValueError(
+            "Normalization stats do not "
+            "contain 'reward'."
+        )
+
+    normalized_rm = normalize_with_stats(
+        rm,
+        normalization_stats[
+            "reward"
+        ],
     )
+
+    # --------------------------------------------------------
+    # RND uncertainty normalization
+    # --------------------------------------------------------
+
+    normalized_rnd_uncertainty = None
 
     need_rnd = any(
         method in methods
@@ -633,6 +629,41 @@ def build_method_scores(
         ]
     )
 
+    if need_rnd:
+
+        if (
+            "rnd_uncertainty"
+            not in normalization_stats
+        ):
+            raise ValueError(
+                "Normalization stats do not "
+                "contain 'rnd_uncertainty'."
+            )
+
+        # Stored Caution convention:
+        #
+        # rnd_score = - uncertainty
+        #
+        # Convert it back into positive uncertainty.
+        rnd_uncertainty = (
+            -rnd
+        )
+
+        normalized_rnd_uncertainty = (
+            normalize_with_stats(
+                rnd_uncertainty,
+                normalization_stats[
+                    "rnd_uncertainty"
+                ],
+            )
+        )
+
+    # --------------------------------------------------------
+    # NeuBoots uncertainty normalization
+    # --------------------------------------------------------
+
+    normalized_nb_uncertainty = None
+
     need_neuboots = any(
         method in methods
         for method in [
@@ -640,42 +671,6 @@ def build_method_scores(
             "rm_neuboots",
         ]
     )
-
-    z_rm = None
-    z_rnd = None
-    z_neuboots = None
-
-    if need_rm:
-
-        (
-            z_rm,
-            rm_mean,
-            rm_std,
-        ) = global_zscore(
-            rm,
-            "RM score",
-        )
-
-        normalization["rm"] = {
-            "mean": rm_mean,
-            "std": rm_std,
-        }
-
-    if need_rnd:
-
-        (
-            z_rnd,
-            rnd_mean,
-            rnd_std,
-        ) = global_zscore(
-            rnd,
-            "RND score",
-        )
-
-        normalization["rnd"] = {
-            "mean": rnd_mean,
-            "std": rnd_std,
-        }
 
     if need_neuboots:
 
@@ -685,58 +680,66 @@ def build_method_scores(
                 "for selected NeuBoots methods."
             )
 
-        # Lower uncertainty is better.
-        # Convert it into a score for argmax.
-        neuboots_pessimism = (
-            -neuboots_uncertainty
+        if (
+            "neuboots_uncertainty"
+            not in normalization_stats
+        ):
+            raise ValueError(
+                "Normalization stats do not "
+                "contain "
+                "'neuboots_uncertainty'."
+            )
+
+        normalized_nb_uncertainty = (
+            normalize_with_stats(
+                neuboots_uncertainty,
+                normalization_stats[
+                    "neuboots_uncertainty"
+                ],
+            )
         )
 
-        (
-            z_neuboots,
-            nb_mean,
-            nb_std,
-        ) = global_zscore(
-            neuboots_pessimism,
-            "NeuBoots pessimism score",
-        )
-
-        normalization[
-            "neuboots_pessimism"
-        ] = {
-            "mean": nb_mean,
-            "std": nb_std,
-        }
+    # --------------------------------------------------------
+    # Method scores
+    # --------------------------------------------------------
 
     for method in methods:
 
         if method == "rm":
-            scores[method] = z_rm
+
+            scores[method] = (
+                normalized_rm
+            )
 
         elif method == "pessimism":
-            scores[method] = z_rnd
 
+            scores[method] = (
+                -normalized_rnd_uncertainty
+            )
 
         elif method == "caution":
 
             scores[method] = (
-                    rm
-                    + caution_lambda
-                    * rnd
+                normalized_rm
+                - caution_lambda
+                * normalized_rnd_uncertainty
             )
 
         elif (
             method
             == "neuboots_pessimism"
         ):
+
             scores[method] = (
-                z_neuboots
+                -normalized_nb_uncertainty
             )
 
         elif method == "rm_neuboots":
+
             scores[method] = (
-                    rm
-                    - neuboots_lambda
-                    * neuboots_uncertainty
+                normalized_rm
+                - neuboots_lambda
+                * normalized_nb_uncertainty
             )
 
         else:
@@ -744,10 +747,7 @@ def build_method_scores(
                 f"Unsupported method: {method}"
             )
 
-    return (
-        scores,
-        normalization,
-    )
+    return scores
 
 
 # ============================================================
@@ -763,10 +763,9 @@ def evaluate_methods(
         bootstrap_seed=42,
 ):
     """
-    Evaluate only the specified N grid.
+    Evaluate only:
 
-    This intentionally does NOT evaluate
-    every N from 1 to 512.
+        N = 1, 2, 4, ..., 512
     """
 
     rows = []
@@ -854,15 +853,17 @@ def evaluate_methods(
     return rows
 
 
+# ============================================================
+# Summary
+# ============================================================
+
 def build_summary(
         curve_df,
         caution_lambda,
         neuboots_lambda,
 ):
     """
-    Peak is computed ONLY over the evaluated
-    N grid, exactly like the previous
-    reproduction workflow.
+    Peak is computed only over N_VALUES.
     """
 
     rows = []
@@ -879,22 +880,25 @@ def build_summary(
 
         subset = (
             curve_df[
-                curve_df["method"]
-                == method
+                curve_df[
+                    "method"
+                ] == method
             ]
             .sort_values("N")
-            .reset_index(drop=True)
+            .reset_index(
+                drop=True
+            )
         )
 
-        peak_idx = int(
+        peak_pos = int(
             subset[
                 "accuracy"
-            ].idxmax()
+            ].to_numpy().argmax()
         )
 
         peak_row = (
-            subset.loc[
-                peak_idx
+            subset.iloc[
+                peak_pos
             ]
         )
 
@@ -920,7 +924,10 @@ def build_summary(
                 caution_lambda
             )
 
-        elif method == "rm_neuboots":
+        elif (
+            method
+            == "rm_neuboots"
+        ):
             method_weight = (
                 neuboots_lambda
             )
@@ -1027,8 +1034,48 @@ def build_summary(
 
 
 # ============================================================
-# Printing
+# Console printing
 # ============================================================
+
+def print_normalization_stats(
+        normalization_stats,
+):
+    print()
+    print("=" * 72)
+    print(
+        "Independent normalization statistics"
+    )
+    print("=" * 72)
+
+    for name, stats in (
+        normalization_stats.items()
+    ):
+        if not isinstance(
+            stats,
+            dict,
+        ):
+            continue
+
+        if (
+            "mean" not in stats
+            or "std" not in stats
+        ):
+            continue
+
+        n = stats.get(
+            "num_values",
+            "N/A",
+        )
+
+        print(
+            f"{name:<24}"
+            f"mean={stats['mean']:>12.6f}  "
+            f"std={stats['std']:>12.6f}  "
+            f"n={n}"
+        )
+
+    print("=" * 72)
+
 
 def print_summary(
         summary_df,
@@ -1037,13 +1084,13 @@ def print_summary(
     print("=" * 96)
 
     print(
-        "Figure 3 reproduction summary"
+        "Figure 3 evaluation summary"
     )
 
     print("=" * 96)
 
     print(
-        f"{'Method':<28}"
+        f"{'Method':<30}"
         f"{'Peak':>10}"
         f"{'Peak N':>10}"
         f"{'Final':>10}"
@@ -1058,7 +1105,7 @@ def print_summary(
     ):
 
         print(
-            f"{row['method_display_name']:<28}"
+            f"{row['method_display_name']:<30}"
             f"{row['peak_accuracy_percent']:>9.1f}%"
             f"{int(row['peak_n']):>10d}"
             f"{row['final_accuracy_percent']:>9.1f}%"
@@ -1094,11 +1141,22 @@ def main():
     )
 
     parser.add_argument(
+        "--normalization-stats",
+        required=True,
+        type=Path,
+        help=(
+            "Normalization statistics fitted "
+            "on an independent response set."
+        ),
+    )
+
+    parser.add_argument(
         "--neuboots-results",
         type=Path,
         default=None,
         help=(
-            "NeuBoots scored_candidates.jsonl"
+            "NeuBoots "
+            "scored_candidates.jsonl"
         ),
     )
 
@@ -1145,6 +1203,10 @@ def main():
 
     args = parser.parse_args()
 
+    # --------------------------------------------------------
+    # Validate NeuBoots requirement
+    # --------------------------------------------------------
+
     use_neuboots = any(
         method in args.methods
         for method in [
@@ -1163,10 +1225,32 @@ def main():
             "when using a NeuBoots method."
         )
 
+    # --------------------------------------------------------
+    # Output directory
+    # --------------------------------------------------------
+
     args.output_dir.mkdir(
         parents=True,
         exist_ok=True,
     )
+
+    # --------------------------------------------------------
+    # Load independent normalization stats
+    # --------------------------------------------------------
+
+    normalization_stats = (
+        load_normalization_stats(
+            args.normalization_stats
+        )
+    )
+
+    print_normalization_stats(
+        normalization_stats
+    )
+
+    # --------------------------------------------------------
+    # Load Caution candidate data
+    # --------------------------------------------------------
 
     (
         problem_ids,
@@ -1177,6 +1261,10 @@ def main():
         args.caution_detailed
     )
 
+    # --------------------------------------------------------
+    # Load NeuBoots uncertainty if needed
+    # --------------------------------------------------------
+
     neuboots_uncertainty = None
 
     if use_neuboots:
@@ -1186,30 +1274,42 @@ def main():
                 path=(
                     args.neuboots_results
                 ),
-                problem_ids=problem_ids,
+                problem_ids=(
+                    problem_ids
+                ),
                 num_candidates=(
                     accuracy.shape[1]
                 ),
             )
         )
 
-    (
-        method_scores,
-        normalization,
-    ) = build_method_scores(
-        methods=args.methods,
-        rm=rm,
-        rnd=rnd,
-        neuboots_uncertainty=(
-            neuboots_uncertainty
-        ),
-        caution_lambda=(
-            args.caution_lambda
-        ),
-        neuboots_lambda=(
-            args.neuboots_lambda
-        ),
+    # --------------------------------------------------------
+    # Build normalized selection scores
+    # --------------------------------------------------------
+
+    method_scores = (
+        build_method_scores(
+            methods=args.methods,
+            rm=rm,
+            rnd=rnd,
+            normalization_stats=(
+                normalization_stats
+            ),
+            neuboots_uncertainty=(
+                neuboots_uncertainty
+            ),
+            caution_lambda=(
+                args.caution_lambda
+            ),
+            neuboots_lambda=(
+                args.neuboots_lambda
+            ),
+        )
     )
+
+    # --------------------------------------------------------
+    # Valid N values
+    # --------------------------------------------------------
 
     valid_n_values = [
         n
@@ -1217,9 +1317,17 @@ def main():
         if n <= accuracy.shape[1]
     ]
 
+    # --------------------------------------------------------
+    # Evaluate
+    # --------------------------------------------------------
+
     rows = evaluate_methods(
-        dataset_name=args.dataset,
-        accuracy=accuracy,
+        dataset_name=(
+            args.dataset
+        ),
+        accuracy=(
+            accuracy
+        ),
         method_scores=(
             method_scores
         ),
@@ -1248,9 +1356,9 @@ def main():
         ),
     )
 
-    # ----------------------------------------
+    # --------------------------------------------------------
     # Save curve CSV
-    # ----------------------------------------
+    # --------------------------------------------------------
 
     curve_path = (
         args.output_dir
@@ -1262,9 +1370,9 @@ def main():
         index=False,
     )
 
-    # ----------------------------------------
+    # --------------------------------------------------------
     # Save summary CSV
-    # ----------------------------------------
+    # --------------------------------------------------------
 
     summary_path = (
         args.output_dir
@@ -1276,9 +1384,9 @@ def main():
         index=False,
     )
 
-    # ----------------------------------------
-    # Save metadata / full result JSON
-    # ----------------------------------------
+    # --------------------------------------------------------
+    # Save full result metadata
+    # --------------------------------------------------------
 
     result = {
         "dataset":
@@ -1315,10 +1423,40 @@ def main():
             args.neuboots_lambda,
 
         "normalization_scope":
-            "global_dataset_problem_candidate",
+            "independent_response_set",
 
-        "normalization":
-            normalization,
+        "normalization_stats_path":
+            str(
+                args.normalization_stats
+            ),
+
+        "normalization_stats":
+            normalization_stats,
+
+        "score_definitions": {
+            "rm":
+                "normalized_reward",
+
+            "pessimism":
+                "-normalized_rnd_uncertainty",
+
+            "caution":
+                (
+                    "normalized_reward "
+                    "- caution_lambda * "
+                    "normalized_rnd_uncertainty"
+                ),
+
+            "neuboots_pessimism":
+                "-normalized_neuboots_uncertainty",
+
+            "rm_neuboots":
+                (
+                    "normalized_reward "
+                    "- neuboots_lambda * "
+                    "normalized_neuboots_uncertainty"
+                ),
+        },
 
         "num_bootstrap":
             args.num_bootstrap,
@@ -1357,6 +1495,10 @@ def main():
             f,
             indent=2,
         )
+
+    # --------------------------------------------------------
+    # Print
+    # --------------------------------------------------------
 
     print_summary(
         summary_df
