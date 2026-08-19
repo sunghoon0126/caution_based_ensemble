@@ -1,0 +1,19 @@
+{
+    "type": "openai",
+    "inference_kwargs": {
+        "openai_model": "llama32-3b-instruct",
+        "openai_key": [
+            "EMPTY"
+        ],
+        "openai_api_base": [
+            "http://127.0.0.1:8000/v1"
+        ],
+        "num_workers": 8,
+        "trial_run": false,
+        "dump_individual_rsp": true,
+        "generation_config": {
+            "max_tokens": 500,
+            "temperature": 1.0
+        }
+    }
+}

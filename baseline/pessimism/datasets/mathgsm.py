@@ -2,7 +2,7 @@
 import logging
 import re
 import pandas as pd
-from baseline.pessimism.datasets import load_dataset, Dataset as HFDataset
+from datasets import load_dataset, Dataset as HFDataset
 from typing import Dict, Any, Optional, List
 import requests
 import io
@@ -417,7 +417,7 @@ class MathGSMDataset(SpecialCompletionDataset):
         if question is None or answer is None:
             raise ValueError(f"Missing 'problem'/'Question' or 'answer'/'Answer'/'solution' in raw data instance: {data}")
 
-        # Define generation config - GSM8K style
+        # Define generation configs - GSM8K style
         generation_config = {"stop_sequences": ["\n\n", "Q:", "Question:"]}
 
         return MathGSMProblem(

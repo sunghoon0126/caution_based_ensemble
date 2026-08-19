@@ -34,7 +34,6 @@ def create_bootstrap_groups(
 
     if remainder != 0:
         pad_size = n_a - remainder
-        indices = n_a - remainder
 
         indices = np.pad(
             indices,
@@ -123,8 +122,8 @@ class RewardValuePredictor(nn.Module):
         if embedding_strategy not in valid_strategies:
             raise ValueError(f"embedding_strategy must be one of {valid_strategies}, got {embedding_strategy}")
 
-        # Load the models config to get architecture details
-        logger.info(f"Loading models config from {model_path} for predictor (exact_architecture={exact_architecture}, embedding_strategy={embedding_strategy})")
+        # Load the models configs to get architecture details
+        logger.info(f"Loading models configs from {model_path} for predictor (exact_architecture={exact_architecture}, embedding_strategy={embedding_strategy})")
         base_model = AutoModelForSequenceClassification.from_pretrained(
             model_path, trust_remote_code=True
         )
@@ -159,7 +158,7 @@ class RewardValuePredictor(nn.Module):
             self.projection = None
             logger.info("No projection layer")
 
-        self.reward_head = nn.Linear(hidden_size, 1)
+        self.reward_head = NbsRewardHead(in_feat=hidden_size)
 
         logger.info(f"Created predictor: model_type={self.model_type}, exact_architecture={exact_architecture}, embedding_strategy={embedding_strategy}, layers={num_layers}, hidden_size={hidden_size}")
         logger.info(f"Added scalar reward_head layer")
@@ -248,8 +247,8 @@ class RewardValuePredictor(nn.Module):
         elif hasattr(model, 'roberta'):
             return 'roberta'
         else:
-            # Try to infer from config
-            config = getattr(model, 'config', None)
+            # Try to infer from configs
+            config = getattr(model, 'configs', None)
             if config:
                 model_type = getattr(config, 'model_type', None)
                 if model_type:
@@ -298,7 +297,7 @@ class RewardValuePredictor(nn.Module):
             nn.init.ones_(module.weight)
             nn.init.zeros_(module.bias)
 
-    def forward(self, input_ids, attention_mask):
+    def forward(self, input_ids, attention_mask, alpha = None):
         """
         Predict the target network's output.
 
@@ -338,7 +337,7 @@ class RewardValuePredictor(nn.Module):
             hidden_states = self.projection(hidden_states)
 
         pooled_features = hidden_states[:, 0, :]
-        reward_pred = self.reward_head(pooled_features)
+        reward_pred = self.reward_head(pooled_features, alpha=alpha)
 
         return reward_pred.squeeze(-1)
 
@@ -469,7 +468,7 @@ class RewardValueModel:
             use_loss_noise: If True, adds Gaussian noise to residual before squaring
             loss_noise_std: Standard deviation of Gaussian noise (used  if use_loss_noise)
         """
-        logger.info(f"Training RND predictor on {len(prompts)} examples")
+        logger.info(f"Training NeuBoots reward predictor on {len(prompts)} examples")
 
         # Create dataset and dataloader
         group_indices = create_bootstrap_groups(
@@ -582,9 +581,9 @@ class RewardValueModel:
         # Save the trained models
         if save_path:
             os.makedirs(save_path, exist_ok=True)
-            torch.save(self.predictor_network.state_dict(), os.path.join(save_path, "rnd_predictor.pt"))
+            torch.save(self.predictor_network.state_dict(), os.path.join(save_path, "reward_predictor.pt"))
 
-            # Save config
+            # Save configs
             config = {
                 "reward_model_path": self.reward_model_path,
                 "predictor_layers": self.predictor_layers,
@@ -600,68 +599,193 @@ class RewardValueModel:
         # Set predictor to eval mode
         self.predictor_network.eval()
 
-@torch.inference_mode()
-def compare_reward(
+    @torch.inference_mode()
+    def compare_reward(
+            self,
+            prompt: str,
+            response: str,
+    ) -> Dict[str, float]:
+
+        inputs = self.tokenizer(
+            prompt,
+            response,
+            return_tensors="pt",
+            truncation=True,
+            max_length=512,
+        ).to(self.device)
+
+        self.predictor_network.eval()
+
+        outputs = self.reward_model(**inputs)
+
+        target_reward = outputs.logits.squeeze(-1).item()
+
+        predictor_reward = self.predictor_network(
+            inputs["input_ids"],
+            inputs["attention_mask"]
+        ).item()
+
+        error = abs(
+            predictor_reward - target_reward
+        )
+
+        return {
+            "target_reward": target_reward,
+            "predictor_reward": predictor_reward,
+            "absolute_error": error,
+        }
+
+    @torch.inference_mode()
+    def predict_mc(
         self,
         prompt: str,
         response: str,
-) -> Dict[str, float]:
+        num_mc: int = 20,
+    ) -> torch.Tensor:
 
-    inputs = self.tokenizer(
-        prompt,
-        response,
-        return_tensors="pt",
-        truncation=True,
-    ).to(self.device)
+        if num_mc <= 0:
+            raise ValueError(
+                f"num_mc must be positive, got {num_mc}"
+            )
 
-    outputs = self.reward_model(**inputs)
+        self.predictor_network.eval()
 
-    target_reward = outputs.logits.squeeze(-1).item()
+        inputs = self.tokenizer(
+            prompt,
+            response,
+            return_tensors="pt",
+            truncation=True,
+            max_length=512,
+        ).to(self.device)
 
-    predictor_reward = self.predictor_network(
-        inputs["input_ids"],
-        inputs["attention_mask"]
-    ).item()
-
-    error = abs(
-        predictor_reward - target_reward
-    )
-
-    return {
-        "target_reward": target_reward,
-        "predictor_reward": predictor_reward,
-        "absolute error": error
-    }
-
-@torch.inference_mode()
-def predict_mc(
-    self,
-    prompt: str,
-    response: str,
-    num_mc: int = 20,
-) -> torch.Tensor:
-
-    if num_mc <= 0:
-        raise ValueError(
-            f"num_mc must be positive, got {num_mc}"
+        reward_samples = self.predictor_network(
+            inputs["input_ids"],
+            inputs["attention_mask"],
+            alpha=num_mc,
         )
 
-    self.predictor_network.eval()
+        reward_samples = reward_samples[:, 0]
 
-    inputs = self.tokenizer(
-        prompt,
-        response,
-        return_tensors="pt",
-        truncation=True,
-        max_length=512,
-    ).to(self.device)
+        return reward_samples.cpu()
 
-    reward_samples = self.predictor_network(
-        inputs["input_ids"],
-        inputs["attention_mask"],
-        alpha=num_mc,
-    )
+    @torch.inference_mode()
+    def compute_reward_score(
+            self,
+            prompt: str,
+            response: str,
+    ) -> float:
 
-    reward_samples = reward_samples[:, 0]
+        inputs = self.tokenizer(
+            prompt,
+            response,
+            return_tensors="pt",
+            truncation=True,
+            max_length=512,
+        ).to(self.device)
 
-    return reward_samples.cpu()
+        outputs = self.reward_model(
+            **inputs
+        )
+
+        reward = (
+            outputs.logits
+            .squeeze(-1)
+            .item()
+        )
+
+        return reward
+
+    def compute_uncertainty_from_samples(
+            self,
+            reward_samples: torch.Tensor,
+            uncertainty_type: str = "std",
+    ) -> float:
+
+        if reward_samples.numel() == 0:
+            raise ValueError(
+                "reward_samples must not be empty"
+            )
+
+        if uncertainty_type == "std":
+
+            uncertainty = reward_samples.std(
+                unbiased=False
+            )
+
+        elif uncertainty_type == "mean_distance":
+
+            reward_mean = reward_samples.mean()
+
+            uncertainty = (
+                    reward_samples - reward_mean
+            ).abs().mean()
+
+        else:
+            raise ValueError(
+                f"Unsupported uncertainty_type: "
+                f"{uncertainty_type}. "
+                f"Choose from ['std', 'mean_distance']."
+            )
+
+        return uncertainty.item()
+
+    @torch.inference_mode()
+    def compute_uncertainty(
+            self,
+            prompt: str,
+            response: str,
+            num_mc: int = 20,
+            uncertainty_type: str = "std",
+    ) -> float:
+
+        reward_samples = self.predict_mc(
+            prompt=prompt,
+            response=response,
+            num_mc=num_mc,
+        )
+
+        return self.compute_uncertainty_from_samples(
+            reward_samples=reward_samples,
+            uncertainty_type=uncertainty_type,
+        )
+
+    @torch.inference_mode()
+    def compute_pessimistic_score(
+            self,
+            prompt: str,
+            response: str,
+            num_mc: int = 20,
+            uncertainty_type: str = "std",
+            pessimism_weight: float = 1.0,
+    ) -> Dict[str, float]:
+
+        # 1. Original reward model score
+        reward = self.compute_reward_score(
+            prompt=prompt,
+            response=response,
+        )
+
+        # 2. NeuBoots MC reward predictions
+        reward_samples = self.predict_mc(
+            prompt=prompt,
+            response=response,
+            num_mc=num_mc,
+        )
+
+        # 3. Ensemble uncertainty
+        uncertainty = self.compute_uncertainty_from_samples(
+            reward_samples=reward_samples,
+            uncertainty_type=uncertainty_type,
+        )
+
+        # 4. Caution-style pessimistic score
+        pessimistic_score = (
+                reward
+                - pessimism_weight * uncertainty
+        )
+
+        return {
+            "reward": reward,
+            "uncertainty": uncertainty,
+            "pessimistic_score": pessimistic_score,
+        }

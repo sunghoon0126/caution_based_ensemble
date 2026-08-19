@@ -2,7 +2,7 @@
 import logging
 import re
 import random
-from baseline.pessimism.datasets import load_dataset, Dataset as HFDataset, concatenate_datasets
+from datasets import load_dataset, Dataset as HFDataset, concatenate_datasets
 from typing import Dict, Any, Optional, List
 
 # Import the new base classes
@@ -396,7 +396,7 @@ class BBHDataset(SpecialCompletionDataset):
         if "subset" in data:
             extra["bbh_subset"] = data["subset"]
 
-        # Define generation config for BBH
+        # Define generation configs for BBH
         generation_config = {"stop_sequences": ["\n\n", "Q:", "Question:"]}
 
         return BBHProblem(

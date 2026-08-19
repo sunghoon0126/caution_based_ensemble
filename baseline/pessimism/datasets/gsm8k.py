@@ -1,7 +1,7 @@
 # pessimism/datasets/gsm8k.py
 import logging
 import re
-from baseline.pessimism.datasets import load_dataset, Dataset as HFDataset # Import Hugging Face Dataset type
+from datasets import load_dataset, Dataset as HFDataset # Import Hugging Face Dataset type
 from typing import Dict, Any, Optional, List
 
 # Import the new base classes
@@ -192,7 +192,7 @@ class GSM8KDataset(SpecialCompletionDataset):
         if question is None or answer_str is None:
             raise ValueError(f"Missing 'question' or 'answer' in raw data instance: {data}")
 
-        # Define generation config (e.g., stop sequences) if needed for GSM8K
+        # Define generation configs (e.g., stop sequences) if needed for GSM8K
         generation_config = {"stop_sequences": ["\n\n", "Q:", "Question:"]} # Example
 
         return GSM8KProblem(
