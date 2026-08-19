@@ -734,13 +734,9 @@ def build_method_scores(
 
         elif method == "rm_neuboots":
             scores[method] = (
-                (
-                    1.0
+                    rm
                     - neuboots_lambda
-                )
-                * z_rm
-                + neuboots_lambda
-                * z_neuboots
+                    * neuboots_uncertainty
             )
 
         else:
