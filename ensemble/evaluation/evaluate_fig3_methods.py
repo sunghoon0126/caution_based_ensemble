@@ -715,15 +715,13 @@ def build_method_scores(
         elif method == "pessimism":
             scores[method] = z_rnd
 
+
         elif method == "caution":
+
             scores[method] = (
-                (
-                    1.0
-                    - caution_lambda
-                )
-                * z_rm
-                + caution_lambda
-                * z_rnd
+                    rm
+                    + caution_lambda
+                    * rnd
             )
 
         elif (
