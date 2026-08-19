@@ -399,7 +399,7 @@ def main() -> None:
     )
 
     parser.add_argument(
-        "--inference-configs",
+        "--inference-config",
         type=str,
         default=None,
         help=(
