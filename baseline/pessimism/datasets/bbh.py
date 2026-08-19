@@ -396,7 +396,7 @@ class BBHDataset(SpecialCompletionDataset):
         if "subset" in data:
             extra["bbh_subset"] = data["subset"]
 
-        # Define generation config for BBH
+        # Define generation configs for BBH
         generation_config = {"stop_sequences": ["\n\n", "Q:", "Question:"]}
 
         return BBHProblem(

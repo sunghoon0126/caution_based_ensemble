@@ -417,7 +417,7 @@ class MathGSMDataset(SpecialCompletionDataset):
         if question is None or answer is None:
             raise ValueError(f"Missing 'problem'/'Question' or 'answer'/'Answer'/'solution' in raw data instance: {data}")
 
-        # Define generation config - GSM8K style
+        # Define generation configs - GSM8K style
         generation_config = {"stop_sequences": ["\n\n", "Q:", "Question:"]}
 
         return MathGSMProblem(

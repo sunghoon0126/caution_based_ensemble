@@ -122,8 +122,8 @@ class RewardValuePredictor(nn.Module):
         if embedding_strategy not in valid_strategies:
             raise ValueError(f"embedding_strategy must be one of {valid_strategies}, got {embedding_strategy}")
 
-        # Load the models config to get architecture details
-        logger.info(f"Loading models config from {model_path} for predictor (exact_architecture={exact_architecture}, embedding_strategy={embedding_strategy})")
+        # Load the models configs to get architecture details
+        logger.info(f"Loading models configs from {model_path} for predictor (exact_architecture={exact_architecture}, embedding_strategy={embedding_strategy})")
         base_model = AutoModelForSequenceClassification.from_pretrained(
             model_path, trust_remote_code=True
         )
@@ -247,8 +247,8 @@ class RewardValuePredictor(nn.Module):
         elif hasattr(model, 'roberta'):
             return 'roberta'
         else:
-            # Try to infer from config
-            config = getattr(model, 'config', None)
+            # Try to infer from configs
+            config = getattr(model, 'configs', None)
             if config:
                 model_type = getattr(config, 'model_type', None)
                 if model_type:
@@ -583,7 +583,7 @@ class RewardValueModel:
             os.makedirs(save_path, exist_ok=True)
             torch.save(self.predictor_network.state_dict(), os.path.join(save_path, "reward_predictor.pt"))
 
-            # Save config
+            # Save configs
             config = {
                 "reward_model_path": self.reward_model_path,
                 "predictor_layers": self.predictor_layers,

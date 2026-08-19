@@ -9,6 +9,8 @@ from typing import List, Dict, Optional, Tuple
 
 # Import the reward model
 from ensemble.models.neuboots_reward_model import RewardValueModel
+from baseline.pessimism.datasets.gsm8k import GSM8KDataset
+from baseline.pessimism.models.openai_model import run_openai_inference
 
 # Set up logging
 logging.basicConfig(
@@ -24,6 +26,155 @@ def set_seed(seed):
 
     if torch.cuda.is_available():
         torch.cuda.manual_seed_all(seed)
+
+def load_gsm8k_train_data(
+        seed: int = 42,
+        max_examples: Optional[int] = None,
+) -> GSM8KDataset:
+
+    logger.info(
+        f"Loading GSM8K train split "
+        f"(seed={seed}, max_examples={max_examples})"
+    )
+
+    prompt_postprocessor_config = {
+        "system_prompt": (
+            "Solve the following problem step by step. "
+            "Give your final numerical answer at the end with: "
+            "#### {NUM}"
+        ),
+        "add_generation_prompt": True,
+    }
+
+    dataset = GSM8KDataset(
+        seed=seed,
+        split="train",
+        name_or_path="gsm8k",
+        config_name="main",
+        fewshot_num=0,
+        prompt_postprocessor_config=(
+            prompt_postprocessor_config
+        ),
+    )
+
+    if (
+        max_examples is not None
+        and max_examples < len(dataset)
+    ):
+        dataset.problems = dataset.problems[
+            :max_examples
+        ]
+
+    logger.info(
+        f"Using {len(dataset)} GSM8K "
+        f"training problems"
+    )
+
+    return dataset
+
+def generate_responses(
+        dataset: GSM8KDataset,
+        inference_config: Dict,
+        output_path: str,
+        num_samples_per_problem: int = 1,
+) -> str:
+
+    os.makedirs(
+        output_path,
+        exist_ok=True,
+    )
+
+    logger.info(
+        f"Generating responses for "
+        f"{len(dataset)} problems "
+        f"({num_samples_per_problem} per problem)"
+    )
+
+    requests = []
+
+    for problem_idx, problem in enumerate(dataset):
+
+        prompt = problem.prompt
+
+        if not prompt:
+            logger.warning(
+                f"Skipping problem {problem_idx}: "
+                f"empty prompt"
+            )
+            continue
+
+        for sample_idx in range(
+            num_samples_per_problem
+        ):
+
+            request_uuid = (
+                f"gsm8k_train_"
+                f"{problem_idx}_"
+                f"sample_{sample_idx}"
+            )
+
+            requests.append(
+                {
+                    "uuid": request_uuid,
+                    "prompt": prompt,
+                    "messages": [
+                        {
+                            "role": "user",
+                            "content": prompt,
+                        }
+                    ],
+                }
+            )
+
+    logger.info(
+        f"Prepared {len(requests)} "
+        f"generation requests"
+    )
+
+    inference_type = inference_config.get(
+        "type",
+        "openai",
+    )
+
+    if inference_type != "openai":
+        raise ValueError(
+            f"Only OpenAI-compatible inference "
+            f"is currently supported, got "
+            f"{inference_type}"
+        )
+
+    inference_kwargs = (
+        inference_config
+        .get("inference_kwargs", {})
+        .copy()
+    )
+
+    inference_kwargs["output_path"] = (
+        output_path
+    )
+
+    run_openai_inference(
+        requests=requests,
+        **inference_kwargs,
+    )
+
+    responses_file = os.path.join(
+        output_path,
+        "all_responses.jsonl",
+    )
+
+    if not os.path.exists(responses_file):
+        raise FileNotFoundError(
+            f"Generated responses file "
+            f"not found: {responses_file}"
+        )
+
+    logger.info(
+        f"Responses saved to "
+        f"{responses_file}"
+    )
+
+    return responses_file
 
 def extract_prompt_response(
         item: Dict,
@@ -150,7 +301,7 @@ def train(args) -> None:
 
     prompts, responses = load_training_pairs(
         responses_file=args.responses_file,
-        max_examples=args.max_examples,
+        max_examples=None,
     )
 
     logger.info(
@@ -221,9 +372,9 @@ def main() -> None:
     parser.add_argument(
         "--responses-file",
         type=str,
-        required=True,
+        default=None,
         help=(
-            "JSONL file containing "
+            "Existing JSONL file containing "
             "prompt-response pairs."
         ),
     )
@@ -235,6 +386,41 @@ def main() -> None:
         help=(
             "Maximum number of training "
             "examples to load."
+        ),
+    )
+
+    parser.add_argument(
+        "--generate-responses",
+        action="store_true",
+        help=(
+            "Generate GSM8K training responses "
+            "before training."
+        ),
+    )
+
+    parser.add_argument(
+        "--inference-configs",
+        type=str,
+        default=None,
+        help=(
+            "JSON configs for OpenAI-compatible "
+            "LLM inference."
+        ),
+    )
+
+    parser.add_argument(
+        "--generation-output-path",
+        type=str,
+        default=None,
+    )
+
+    parser.add_argument(
+        "--num-samples",
+        type=int,
+        default=1,
+        help=(
+            "Number of generated responses "
+            "per GSM8K problem."
         ),
     )
 
@@ -359,6 +545,47 @@ def main() -> None:
         args.output_path,
         exist_ok=True,
     )
+
+    if args.generate_responses:
+
+        if args.inference_config is None:
+            raise ValueError(
+                "--inference-configs is required "
+                "when --generate-responses is used."
+            )
+
+        if args.generation_output_path is None:
+            args.generation_output_path = os.path.join(
+                args.output_path,
+                "generated_responses",
+            )
+
+        dataset = load_gsm8k_train_data(
+            seed=args.seed,
+            max_examples=args.max_examples,
+        )
+
+        with open(
+                args.inference_config,
+                "r",
+                encoding="utf-8",
+        ) as f:
+            inference_config = json.load(f)
+
+        args.responses_file = generate_responses(
+            dataset=dataset,
+            inference_config=inference_config,
+            output_path=args.generation_output_path,
+            num_samples_per_problem=args.num_samples,
+        )
+
+    else:
+
+        if args.responses_file is None:
+            raise ValueError(
+                "Provide --responses-file or use "
+                "--generate-responses."
+            )
 
     train(args)
 
