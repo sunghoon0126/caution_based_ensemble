@@ -599,6 +599,39 @@ class RewardValueModel:
         # Set predictor to eval mode
         self.predictor_network.eval()
 
+    def load_predictor(
+            self,
+            checkpoint_path: str,
+    ) -> None:
+
+        if os.path.isdir(checkpoint_path):
+            checkpoint_path = os.path.join(
+                checkpoint_path,
+                "reward_predictor.pt",
+            )
+
+        if not os.path.exists(checkpoint_path):
+            raise FileNotFoundError(
+                f"Predictor checkpoint not found: "
+                f"{checkpoint_path}"
+            )
+
+        state_dict = torch.load(
+            checkpoint_path,
+            map_location=self.device,
+        )
+
+        self.predictor_network.load_state_dict(
+            state_dict
+        )
+
+        self.predictor_network.eval()
+
+        logger.info(
+            f"Loaded reward predictor from "
+            f"{checkpoint_path}"
+        )
+
     @torch.inference_mode()
     def compare_reward(
             self,
