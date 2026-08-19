@@ -1,7 +1,7 @@
 # pessimism/datasets/gsm8k.py
 import logging
 import re
-from baseline.pessimism.datasets import load_dataset, Dataset as HFDataset # Import Hugging Face Dataset type
+from datasets import load_dataset, Dataset as HFDataset # Import Hugging Face Dataset type
 from typing import Dict, Any, Optional, List
 
 # Import the new base classes
