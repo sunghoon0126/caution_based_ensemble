@@ -100,6 +100,8 @@ def score_batch(
         responses,
         num_mc: int,
         device: str,
+        quantile_low: float = 0.1,
+        quantile_high: float = 0.9,
 ):
     prompts = [prompt] * len(responses)
 
@@ -140,9 +142,39 @@ def score_batch(
         unbiased=False,
     )
 
+    if not (
+        0.0 <= quantile_low
+        < quantile_high
+        <= 1.0
+    ):
+        raise ValueError(
+            "Expected 0 <= quantile_low "
+            "< quantile_high <= 1, got "
+            f"{quantile_low}, {quantile_high}"
+        )
+
+    mc_q_low = torch.quantile(
+        reward_samples,
+        q=quantile_low,
+        dim=0,
+    )
+
+    mc_q_high = torch.quantile(
+        reward_samples,
+        q=quantile_high,
+        dim=0,
+    )
+
+    mc_quantile_width = (
+        mc_q_high - mc_q_low
+    )
+
     return (
         mc_mean.cpu().tolist(),
         mc_std.cpu().tolist(),
+        mc_q_low.cpu().tolist(),
+        mc_q_high.cpu().tolist(),
+        mc_quantile_width.cpu().tolist(),
     )
 
 
@@ -208,6 +240,26 @@ def main():
     )
 
     parser.add_argument(
+        "--quantile-low",
+        type=float,
+        default=0.1,
+        help=(
+            "Lower MC prediction quantile used "
+            "for quantile-width uncertainty."
+        ),
+    )
+
+    parser.add_argument(
+        "--quantile-high",
+        type=float,
+        default=0.9,
+        help=(
+            "Upper MC prediction quantile used "
+            "for quantile-width uncertainty."
+        ),
+    )
+
+    parser.add_argument(
         "--max-problems",
         type=int,
         default=None,
@@ -226,6 +278,16 @@ def main():
     )
 
     args = parser.parse_args()
+
+    if not (
+        0.0 <= args.quantile_low
+        < args.quantile_high
+        <= 1.0
+    ):
+        raise ValueError(
+            "Expected 0 <= --quantile-low "
+            "< --quantile-high <= 1."
+        )
 
     set_seed(args.seed)
 
@@ -294,7 +356,10 @@ def main():
                 )
 
             all_mc_mean = []
-            all_uncertainty = []
+            all_uncertainty_std = []
+            all_quantile_low = []
+            all_quantile_high = []
+            all_uncertainty_quantile = []
 
             for start in range(
                 0,
@@ -310,29 +375,66 @@ def main():
                     start:end
                 ]
 
-                mc_mean, mc_std = score_batch(
+                (
+                    mc_mean,
+                    mc_std,
+                    mc_q_low,
+                    mc_q_high,
+                    mc_quantile_width,
+                ) = score_batch(
                     tokenizer=tokenizer,
                     predictor=predictor,
                     prompt=prompt,
                     responses=batch_responses,
                     num_mc=args.num_mc,
                     device=args.device,
+                    quantile_low=args.quantile_low,
+                    quantile_high=args.quantile_high,
                 )
 
                 all_mc_mean.extend(
                     mc_mean
                 )
 
-                all_uncertainty.extend(
+                all_uncertainty_std.extend(
                     mc_std
+                )
+
+                all_quantile_low.extend(
+                    mc_q_low
+                )
+
+                all_quantile_high.extend(
+                    mc_q_high
+                )
+
+                all_uncertainty_quantile.extend(
+                    mc_quantile_width
                 )
 
             result = {
                 "instance_id": instance_id,
                 "num_candidates": len(responses),
                 "num_mc": args.num_mc,
+                "quantile_low": args.quantile_low,
+                "quantile_high": args.quantile_high,
                 "all_neuboots_mc_mean": all_mc_mean,
-                "all_neuboots_uncertainty": all_uncertainty,
+
+                # Backward-compatible STD field.
+                "all_neuboots_uncertainty":
+                    all_uncertainty_std,
+
+                "all_neuboots_uncertainty_std":
+                    all_uncertainty_std,
+
+                "all_neuboots_quantile_low":
+                    all_quantile_low,
+
+                "all_neuboots_quantile_high":
+                    all_quantile_high,
+
+                "all_neuboots_uncertainty_quantile":
+                    all_uncertainty_quantile,
             }
 
             with open(
