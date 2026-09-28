@@ -301,8 +301,33 @@ def train(args) -> None:
 
     prompts, responses = load_training_pairs(
         responses_file=args.responses_file,
-        max_examples=None,
+        max_examples=args.max_examples,
     )
+
+    validation_prompts = None
+    validation_responses = None
+
+    if (
+        args.validation_responses_file
+        is not None
+    ):
+
+        (
+            validation_prompts,
+            validation_responses,
+        ) = load_training_pairs(
+            responses_file=(
+                args.validation_responses_file
+            ),
+            max_examples=(
+                args.validation_max_examples
+            ),
+        )
+
+        logger.info(
+            "Validation examples: "
+            f"{len(validation_prompts)}"
+        )
 
     logger.info(
         f"Reward model: "
@@ -345,11 +370,46 @@ def train(args) -> None:
     model.train(
         prompts=prompts,
         responses=responses,
-        batch_size=args.batch_size,
-        num_epochs=args.num_epochs,
-        learning_rate=args.learning_rate,
-        warmup_steps=args.warmup_steps,
-        save_path=args.output_path,
+
+        batch_size=(
+            args.batch_size
+        ),
+
+        num_epochs=(
+            args.num_epochs
+        ),
+
+        learning_rate=(
+            args.learning_rate
+        ),
+
+        warmup_steps=(
+            args.warmup_steps
+        ),
+
+        save_path=(
+            args.output_path
+        ),
+
+        validation_prompts=(
+            validation_prompts
+        ),
+
+        validation_responses=(
+            validation_responses
+        ),
+
+        validation_batch_size=(
+            args.validation_batch_size
+        ),
+
+        validation_num_mc=(
+            args.validation_num_mc
+        ),
+
+        checkpoint_epochs=(
+            args.checkpoint_epochs
+        ),
     )
 
     logger.info(
@@ -484,6 +544,51 @@ def main() -> None:
         help=(
             "Epoch threshold after which "
             "bootstrap alpha is sampled."
+        ),
+    )
+
+    # ---------------------------------
+    # Checkpoint dynamics experiment
+    # ---------------------------------
+
+    parser.add_argument(
+        "--validation-responses-file",
+        type=str,
+        default=None,
+        help=(
+            "Independent prompt-response JSONL "
+            "used to compare checkpoints."
+        ),
+    )
+
+    parser.add_argument(
+        "--validation-max-examples",
+        type=int,
+        default=1000,
+    )
+
+    parser.add_argument(
+        "--validation-batch-size",
+        type=int,
+        default=32,
+    )
+
+    parser.add_argument(
+        "--validation-num-mc",
+        type=int,
+        default=20,
+    )
+
+    parser.add_argument(
+        "--checkpoint-epochs",
+        nargs="+",
+        type=int,
+        default=None,
+        help=(
+            "Epochs to save/evaluate. "
+            "Epoch 0 means before training. "
+            "Example: "
+            "--checkpoint-epochs 0 1 2 3 5"
         ),
     )
 

@@ -83,3 +83,9 @@ runs/
 *~
 baseline/__from-curiosity-to-caution-iclr/
 baseline/__NeuBoots-master/
+# ============================================================
+# Generated experiment artifacts
+# ============================================================
+
+exports/
+reference_results/

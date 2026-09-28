@@ -1,6 +1,8 @@
 import logging
 import os
 import json
+import csv
+import time
 import numpy as np
 
 import torch
@@ -207,6 +209,42 @@ class RewardValuePredictor(nn.Module):
 
         # Apply random initialization to all parameters
         self.transformer_model.apply(self._init_weights)
+
+        # Apply embedding strategy for exact architecture.
+        # The encoder remains randomly initialized,
+        # while shared_* embeddings use pretrained RM embeddings.
+        if self.model_type == "deberta":
+
+            if self.embedding_strategy == "shared_trainable":
+                self.transformer_model.embeddings = (
+                    base_model.deberta.embeddings
+                )
+
+                for param in self.transformer_model.embeddings.parameters():
+                    param.requires_grad = True
+
+                logger.info(
+                    "Exact architecture: using shared trainable embeddings"
+                )
+
+            elif self.embedding_strategy == "shared_frozen":
+                self.transformer_model.embeddings = (
+                    base_model.deberta.embeddings
+                )
+
+                for param in self.transformer_model.embeddings.parameters():
+                    param.requires_grad = False
+
+                logger.info(
+                    "Exact architecture: using shared frozen embeddings"
+                )
+
+            elif self.embedding_strategy == "separate":
+                # Keep the randomly initialized embeddings
+                # already created above.
+                logger.info(
+                    "Exact architecture: using separate random embeddings"
+                )
 
         # Move to the appropriate device
         if hasattr(base_model, 'device'):
@@ -442,35 +480,493 @@ class RewardValueModel:
             f"use_projection: {self.use_projection}"
         )
 
-    def train(
-        self,
-        prompts: List[str],
-        responses: List[str],
-        batch_size: int = 16,
-        num_epochs: int = 3,
-        learning_rate: float = 5e-5,
-        warmup_steps: int = 100,
-        save_path: Optional[str] = None,
-        use_loss_noise: bool = False,
-        loss_noise_std: float = 0.0,
+    def _save_checkpoint(
+            self,
+            save_path,
+            epoch,
+            global_step,
+            optimizer,
+            scheduler,
+    ):
+        checkpoint_dir = os.path.join(
+            save_path,
+            "checkpoints",
+            f"epoch_{epoch:03d}",
+        )
+
+        os.makedirs(
+            checkpoint_dir,
+            exist_ok=True,
+        )
+
+        # --------------------------------------------------
+        # Predictor weights
+        # --------------------------------------------------
+
+        torch.save(
+            self.predictor_network.state_dict(),
+            os.path.join(
+                checkpoint_dir,
+                "reward_predictor.pt",
+            ),
+        )
+
+        # --------------------------------------------------
+        # Config
+        #
+        # score_gsm8k_neuboots.py can load this directory
+        # directly because the expected filenames are kept.
+        # --------------------------------------------------
+
+        config = {
+            "reward_model_path":
+                self.reward_model_path,
+
+            "predictor_layers":
+                self.predictor_layers,
+
+            "exact_architecture":
+                self.exact_architecture,
+
+            "embedding_strategy":
+                self.embedding_strategy,
+
+            "use_projection":
+                self.use_projection,
+
+            "n_a":
+                self.n_a,
+
+            "epoch_th":
+                self.epoch_th,
+
+            "checkpoint_epoch":
+                epoch,
+        }
+
+        with open(
+            os.path.join(
+                checkpoint_dir,
+                "reward_predictor_config.json",
+            ),
+            "w",
+            encoding="utf-8",
+        ) as f:
+            json.dump(
+                config,
+                f,
+                indent=2,
+            )
+
+        # --------------------------------------------------
+        # Full state for possible resume later
+        # --------------------------------------------------
+
+        torch.save(
+            {
+                "epoch":
+                    epoch,
+
+                "global_step":
+                    global_step,
+
+                "optimizer_state_dict":
+                    optimizer.state_dict(),
+
+                "scheduler_state_dict":
+                    scheduler.state_dict(),
+            },
+            os.path.join(
+                checkpoint_dir,
+                "training_state.pt",
+            ),
+        )
+
+        logger.info(
+            f"Saved checkpoint: "
+            f"{checkpoint_dir}"
+        )
+
+        return checkpoint_dir
+
+
+    @torch.inference_mode()
+    def _evaluate_validation(
+            self,
+            prompts,
+            responses,
+            batch_size=32,
+            num_mc=20,
+            eval_seed=12345,
     ):
         """
-        Train the RND predictor network.
+        Evaluate one checkpoint on one fixed validation set.
 
-        Args:
-            prompts: List of prompts
-            responses: List of responses
-            batch_size: Batch size for training
-            num_epochs: Number of epochs to train for
-            learning_rate: Learning rate
-            warmup_steps: Number of warmup steps for the learning rate scheduler
-            save_path: Path to save the trained models
-            use_loss_noise: If True, adds Gaussian noise to residual before squaring
-            loss_noise_std: Standard deviation of Gaussian noise (used  if use_loss_noise)
+        Metrics
+        -------
+        deterministic_mse:
+            predictor(alpha=None) vs RM target
+
+        mc_mse:
+            mean of MC reward predictions vs RM target
+
+        mae:
+            |MC mean - RM target|
+
+        uncertainty:
+            std over MC reward predictions
         """
-        logger.info(f"Training NeuBoots reward predictor on {len(prompts)} examples")
 
-        # Create dataset and dataloader
+        if (
+            prompts is None
+            or responses is None
+            or len(prompts) == 0
+        ):
+            return {}
+
+        group_indices = np.zeros(
+            len(prompts),
+            dtype=np.int64,
+        )
+
+        dataset = RewardValueDataset(
+            self.tokenizer,
+            prompts,
+            responses,
+            group_indices=group_indices,
+        )
+
+        dataloader = DataLoader(
+            dataset,
+            batch_size=batch_size,
+            shuffle=False,
+        )
+
+        was_training = (
+            self.predictor_network.training
+        )
+
+        self.predictor_network.eval()
+
+        deterministic_squared_errors = []
+        mc_squared_errors = []
+        absolute_errors = []
+        uncertainties = []
+
+        device_obj = torch.device(
+            self.device
+        )
+
+        cuda_devices = []
+
+        if (
+            torch.cuda.is_available()
+            and device_obj.type == "cuda"
+        ):
+            device_index = (
+                device_obj.index
+            )
+
+            if device_index is None:
+                device_index = (
+                    torch.cuda.current_device()
+                )
+
+            cuda_devices = [
+                device_index
+            ]
+
+        # --------------------------------------------------
+        # Use the same random MC masks for every checkpoint.
+        # This makes checkpoint comparisons less noisy.
+        # --------------------------------------------------
+
+        with torch.random.fork_rng(
+            devices=cuda_devices,
+        ):
+
+            torch.manual_seed(
+                eval_seed
+            )
+
+            if torch.cuda.is_available():
+                torch.cuda.manual_seed_all(
+                    eval_seed
+                )
+
+            for batch, _ in tqdm(
+                dataloader,
+                desc="Validation",
+                leave=False,
+            ):
+
+                batch = {
+                    key: value.to(
+                        self.device
+                    )
+                    for key, value
+                    in batch.items()
+                }
+
+                # ------------------------------------------
+                # Target RM score
+                # ------------------------------------------
+
+                reward_outputs = (
+                    self.reward_model(
+                        **batch
+                    )
+                )
+
+                target_reward = (
+                    reward_outputs
+                    .logits
+                    .squeeze(-1)
+                )
+
+                # ------------------------------------------
+                # Deterministic predictor
+                # ------------------------------------------
+
+                deterministic_pred = (
+                    self.predictor_network(
+                        batch["input_ids"],
+                        batch["attention_mask"],
+                        alpha=None,
+                    )
+                )
+
+                deterministic_error = (
+                    deterministic_pred
+                    - target_reward
+                )
+
+                # ------------------------------------------
+                # MC NeuBoots predictions
+                # ------------------------------------------
+
+                mc_samples = (
+                    self.predictor_network(
+                        batch["input_ids"],
+                        batch["attention_mask"],
+                        alpha=num_mc,
+                    )
+                )
+
+                # [num_mc, batch]
+                if mc_samples.dim() != 2:
+                    raise RuntimeError(
+                        "Expected MC samples "
+                        "[num_mc, batch], got "
+                        f"{tuple(mc_samples.shape)}"
+                    )
+
+                mc_mean = (
+                    mc_samples.mean(
+                        dim=0
+                    )
+                )
+
+                mc_std = (
+                    mc_samples.std(
+                        dim=0,
+                        unbiased=False,
+                    )
+                )
+
+                mc_error = (
+                    mc_mean
+                    - target_reward
+                )
+
+                deterministic_squared_errors.extend(
+                    deterministic_error
+                    .pow(2)
+                    .detach()
+                    .cpu()
+                    .tolist()
+                )
+
+                mc_squared_errors.extend(
+                    mc_error
+                    .pow(2)
+                    .detach()
+                    .cpu()
+                    .tolist()
+                )
+
+                absolute_errors.extend(
+                    mc_error
+                    .abs()
+                    .detach()
+                    .cpu()
+                    .tolist()
+                )
+
+                uncertainties.extend(
+                    mc_std
+                    .detach()
+                    .cpu()
+                    .tolist()
+                )
+
+        if was_training:
+            self.predictor_network.train()
+
+        deterministic_squared_errors = (
+            np.asarray(
+                deterministic_squared_errors,
+                dtype=np.float64,
+            )
+        )
+
+        mc_squared_errors = np.asarray(
+            mc_squared_errors,
+            dtype=np.float64,
+        )
+
+        absolute_errors = np.asarray(
+            absolute_errors,
+            dtype=np.float64,
+        )
+
+        uncertainties = np.asarray(
+            uncertainties,
+            dtype=np.float64,
+        )
+
+        return {
+            "val_num_examples":
+                int(
+                    len(
+                        mc_squared_errors
+                    )
+                ),
+
+            "val_deterministic_mse":
+                float(
+                    deterministic_squared_errors.mean()
+                ),
+
+            "val_mc_mse":
+                float(
+                    mc_squared_errors.mean()
+                ),
+
+            "val_mae":
+                float(
+                    absolute_errors.mean()
+                ),
+
+            "val_uncertainty_mean":
+                float(
+                    uncertainties.mean()
+                ),
+
+            "val_uncertainty_median":
+                float(
+                    np.median(
+                        uncertainties
+                    )
+                ),
+
+            "val_uncertainty_std":
+                float(
+                    uncertainties.std(
+                        ddof=0
+                    )
+                ),
+        }
+
+
+    def _write_training_history(
+            self,
+            history,
+            save_path,
+    ):
+        if not save_path:
+            return
+
+        path = os.path.join(
+            save_path,
+            "training_history.csv",
+        )
+
+        fields = [
+            "epoch",
+            "global_step",
+            "train_loss",
+            "elapsed_seconds",
+            "val_num_examples",
+            "val_deterministic_mse",
+            "val_mc_mse",
+            "val_mae",
+            "val_uncertainty_mean",
+            "val_uncertainty_median",
+            "val_uncertainty_std",
+        ]
+
+        with open(
+            path,
+            "w",
+            encoding="utf-8",
+            newline="",
+        ) as f:
+
+            writer = csv.DictWriter(
+                f,
+                fieldnames=fields,
+            )
+
+            writer.writeheader()
+
+            for row in history:
+
+                writer.writerow(
+                    {
+                        field:
+                            row.get(
+                                field,
+                                "",
+                            )
+                        for field
+                        in fields
+                    }
+                )
+
+    def train(
+            self,
+            prompts: List[str],
+            responses: List[str],
+            batch_size: int = 16,
+            num_epochs: int = 3,
+            learning_rate: float = 5e-5,
+            warmup_steps: int = 100,
+            save_path: Optional[str] = None,
+            use_loss_noise: bool = False,
+            loss_noise_std: float = 0.0,
+
+            # New
+            validation_prompts: Optional[List[str]] = None,
+            validation_responses: Optional[List[str]] = None,
+            validation_batch_size: int = 32,
+            validation_num_mc: int = 20,
+            checkpoint_epochs: Optional[List[int]] = None,
+    ):
+        """
+        Train NeuBoots reward predictor while saving and
+        evaluating intermediate checkpoints.
+        """
+
+        logger.info(
+            f"Training NeuBoots reward predictor "
+            f"on {len(prompts)} examples"
+        )
+
+        # ==================================================
+        # Training dataset
+        # ==================================================
+
         group_indices = create_bootstrap_groups(
             num_samples=len(prompts),
             n_a=self.n_a,
@@ -481,122 +977,481 @@ class RewardValueModel:
             self.tokenizer,
             prompts,
             responses,
-            group_indices = group_indices,
+            group_indices=group_indices,
         )
 
         dataloader = DataLoader(
             dataset,
             batch_size=batch_size,
-            shuffle=True
+            shuffle=True,
         )
 
-        # Set up optimizer and scheduler
+        # ==================================================
+        # Optimizer / scheduler
+        # ==================================================
+
         optimizer = torch.optim.AdamW(
             self.predictor_network.parameters(),
-            lr=learning_rate
+            lr=learning_rate,
         )
 
-        total_steps = len(dataloader) * num_epochs
-
-        scheduler = get_linear_schedule_with_warmup(
-            optimizer,
-            num_warmup_steps=warmup_steps,
-            num_training_steps=total_steps
+        total_steps = (
+                len(dataloader)
+                * num_epochs
         )
 
-        # Training loop
+        scheduler = (
+            get_linear_schedule_with_warmup(
+                optimizer,
+                num_warmup_steps=warmup_steps,
+                num_training_steps=total_steps,
+            )
+        )
+
+        # ==================================================
+        # Checkpoint epochs
+        #
+        # If unspecified:
+        #     epoch 0 + every epoch
+        # ==================================================
+
+        if checkpoint_epochs is None:
+            checkpoint_epochs = list(
+                range(
+                    0,
+                    num_epochs + 1,
+                )
+            )
+
+        checkpoint_epochs = sorted(
+            set(
+                checkpoint_epochs
+            )
+        )
+
+        for checkpoint_epoch in (
+                checkpoint_epochs
+        ):
+
+            if (
+                    checkpoint_epoch < 0
+                    or checkpoint_epoch
+                    > num_epochs
+            ):
+                raise ValueError(
+                    "checkpoint epoch must be "
+                    f"between 0 and {num_epochs}, "
+                    f"got {checkpoint_epoch}"
+                )
+
+        logger.info(
+            "Checkpoint epochs: "
+            f"{checkpoint_epochs}"
+        )
+
+        # ==================================================
+        # Training state
+        # ==================================================
+
         self.predictor_network.train()
 
-        alpha = torch.ones(1, self.n_a, device=self.device)
+        alpha = torch.ones(
+            1,
+            self.n_a,
+            device=self.device,
+        )
 
-        for epoch in range(num_epochs):
+        history = []
+
+        global_step = 0
+
+        training_start = (
+            time.time()
+        )
+
+        # ==================================================
+        # Epoch 0
+        #
+        # Before any training.
+        # ==================================================
+
+        if 0 in checkpoint_epochs:
+
+            logger.info(
+                "Evaluating checkpoint epoch 0 "
+                "(before training)"
+            )
+
+            validation_metrics = (
+                self._evaluate_validation(
+                    prompts=(
+                        validation_prompts
+                    ),
+                    responses=(
+                        validation_responses
+                    ),
+                    batch_size=(
+                        validation_batch_size
+                    ),
+                    num_mc=(
+                        validation_num_mc
+                    ),
+                    eval_seed=(
+                            self.seed
+                            + 10000
+                    ),
+                )
+            )
+
+            history_row = {
+                "epoch":
+                    0,
+
+                "global_step":
+                    0,
+
+                "train_loss":
+                    "",
+
+                "elapsed_seconds":
+                    time.time()
+                    - training_start,
+
+                **validation_metrics,
+            }
+
+            history.append(
+                history_row
+            )
+
+            if save_path:
+                self._save_checkpoint(
+                    save_path=save_path,
+                    epoch=0,
+                    global_step=0,
+                    optimizer=optimizer,
+                    scheduler=scheduler,
+                )
+
+                self._write_training_history(
+                    history=history,
+                    save_path=save_path,
+                )
+
+        # ==================================================
+        # Training loop
+        # ==================================================
+
+        for epoch in range(
+                num_epochs
+        ):
+
+            epoch_number = (
+                    epoch + 1
+            )
+
             if epoch > self.epoch_th:
                 alpha = Exponential(
-                    torch.ones(1, self.n_a, device=self.device),
+                    torch.ones(
+                        1,
+                        self.n_a,
+                        device=self.device,
+                    )
                 ).sample()
+
             epoch_loss = 0.0
 
             progress_bar = tqdm(
                 dataloader,
-                desc=f"Epoch {epoch+1}/{num_epochs}"
+                desc=(
+                    f"Epoch "
+                    f"{epoch_number}/"
+                    f"{num_epochs}"
+                ),
             )
 
-            for batch, group_index in progress_bar:
-                # Move batch to device
-                batch = {k: v.to(self.device) for k, v in batch.items()}
-                group_index = group_index.to(self.device)
+            self.predictor_network.train()
 
-                # Get scalar reward
+            for (
+                    batch,
+                    group_index,
+            ) in progress_bar:
+                batch = {
+                    key: value.to(
+                        self.device
+                    )
+                    for key, value
+                    in batch.items()
+                }
+
+                group_index = (
+                    group_index.to(
+                        self.device
+                    )
+                )
+
+                # ------------------------------------------
+                # Target reward
+                # ------------------------------------------
+
                 with torch.no_grad():
-                    reward_outputs = self.reward_model(**batch)
+                    reward_outputs = (
+                        self.reward_model(
+                            **batch
+                        )
+                    )
 
-                    target_reward = reward_outputs.logits.squeeze(-1)
+                    target_reward = (
+                        reward_outputs
+                        .logits
+                        .squeeze(-1)
+                    )
 
-                sample_weights = alpha[0, group_index]
+                # ------------------------------------------
+                # NeuBoots sample weights
+                # ------------------------------------------
 
-                # Get predictor reward - use the same input_ids directly
-                # We don't need to extract embeddings separately anymore
-
-                batch_size_current = batch["input_ids"].size(0)
-                alpha_batch = alpha.repeat(batch_size_current, 1)
-
-                predictor_reward = self.predictor_network(
-                    batch["input_ids"],
-                    batch["attention_mask"],
-                    alpha=alpha_batch,
+                sample_weights = (
+                    alpha[
+                        0,
+                        group_index,
+                    ]
                 )
 
-                # Compute loss
-
-                per_sample_loss = F.mse_loss(
-                    predictor_reward,
-                    target_reward,
-                    reduction="none",
+                batch_size_current = (
+                    batch[
+                        "input_ids"
+                    ].size(0)
                 )
 
-                loss = (per_sample_loss * sample_weights).mean()
+                alpha_batch = (
+                    alpha.repeat(
+                        batch_size_current,
+                        1,
+                    )
+                )
 
-                # Backward pass
+                # ------------------------------------------
+                # Predictor reward
+                # ------------------------------------------
+
+                predictor_reward = (
+                    self.predictor_network(
+                        batch[
+                            "input_ids"
+                        ],
+                        batch[
+                            "attention_mask"
+                        ],
+                        alpha=alpha_batch,
+                    )
+                )
+
+                # ------------------------------------------
+                # Weighted MSE
+                # ------------------------------------------
+
+                per_sample_loss = (
+                    F.mse_loss(
+                        predictor_reward,
+                        target_reward,
+                        reduction="none",
+                    )
+                )
+
+                loss = (
+                        per_sample_loss
+                        * sample_weights
+                ).mean()
+
+                # ------------------------------------------
+                # Optimization
+                # ------------------------------------------
+
                 optimizer.zero_grad()
+
                 loss.backward()
+
                 optimizer.step()
+
                 scheduler.step()
 
-                # Update progress bar
-                epoch_loss += loss.item()
+                global_step += 1
+
+                epoch_loss += (
+                    loss.item()
+                )
 
                 progress_bar.set_postfix(
                     {
-                        "mse loss": epoch_loss / (progress_bar.n + 1)
+                        "mse loss":
+                            epoch_loss
+                            / (
+                                    progress_bar.n
+                                    + 1
+                            )
                     }
                 )
 
-            avg_loss = epoch_loss / len(dataloader)
-
-            logger.info(
-                f"Epoch {epoch+1}/{num_epochs}, "
-                f"Loss: {avg_loss:.6f}, "
+            avg_loss = (
+                    epoch_loss
+                    / len(dataloader)
             )
 
-        # Save the trained models
+            logger.info(
+                f"Epoch "
+                f"{epoch_number}/"
+                f"{num_epochs}, "
+                f"Loss: "
+                f"{avg_loss:.6f}"
+            )
+
+            # ==================================================
+            # Evaluate/save selected checkpoint
+            # ==================================================
+
+            if (
+                    epoch_number
+                    in checkpoint_epochs
+            ):
+
+                logger.info(
+                    "Evaluating checkpoint "
+                    f"epoch {epoch_number}"
+                )
+
+                validation_metrics = (
+                    self._evaluate_validation(
+                        prompts=(
+                            validation_prompts
+                        ),
+                        responses=(
+                            validation_responses
+                        ),
+                        batch_size=(
+                            validation_batch_size
+                        ),
+                        num_mc=(
+                            validation_num_mc
+                        ),
+                        eval_seed=(
+                                self.seed
+                                + 10000
+                        ),
+                    )
+                )
+
+                history_row = {
+                    "epoch":
+                        epoch_number,
+
+                    "global_step":
+                        global_step,
+
+                    "train_loss":
+                        avg_loss,
+
+                    "elapsed_seconds":
+                        time.time()
+                        - training_start,
+
+                    **validation_metrics,
+                }
+
+                history.append(
+                    history_row
+                )
+
+                logger.info(
+                    "Checkpoint metrics: "
+                    f"{validation_metrics}"
+                )
+
+                if save_path:
+                    self._save_checkpoint(
+                        save_path=save_path,
+                        epoch=(
+                            epoch_number
+                        ),
+                        global_step=(
+                            global_step
+                        ),
+                        optimizer=optimizer,
+                        scheduler=scheduler,
+                    )
+
+                    self._write_training_history(
+                        history=history,
+                        save_path=save_path,
+                    )
+
+        # ==================================================
+        # Save final model in old format as well
+        #
+        # Keeps compatibility with all existing scripts.
+        # ==================================================
+
         if save_path:
-            os.makedirs(save_path, exist_ok=True)
-            torch.save(self.predictor_network.state_dict(), os.path.join(save_path, "reward_predictor.pt"))
+            os.makedirs(
+                save_path,
+                exist_ok=True,
+            )
 
-            # Save configs
+            torch.save(
+                self.predictor_network.state_dict(),
+                os.path.join(
+                    save_path,
+                    "reward_predictor.pt",
+                ),
+            )
+
             config = {
-                "reward_model_path": self.reward_model_path,
-                "predictor_layers": self.predictor_layers,
-                "exact_architecture": self.exact_architecture,
-                "embedding_strategy": self.embedding_strategy,
-                "use_projection": self.use_projection
+                "reward_model_path":
+                    self.reward_model_path,
+
+                "predictor_layers":
+                    self.predictor_layers,
+
+                "exact_architecture":
+                    self.exact_architecture,
+
+                "embedding_strategy":
+                    self.embedding_strategy,
+
+                "use_projection":
+                    self.use_projection,
+
+                "n_a":
+                    self.n_a,
+
+                "epoch_th":
+                    self.epoch_th,
             }
-            with open(os.path.join(save_path, "reward_predictor_config.json"), "w") as f:
-                json.dump(config, f, indent=2)
 
-            logger.info(f"Saved reward predictor models to {save_path}")
+            with open(
+                    os.path.join(
+                        save_path,
+                        "reward_predictor_config.json",
+                    ),
+                    "w",
+                    encoding="utf-8",
+            ) as f:
+                json.dump(
+                    config,
+                    f,
+                    indent=2,
+                )
 
-        # Set predictor to eval mode
+            self._write_training_history(
+                history=history,
+                save_path=save_path,
+            )
+
+            logger.info(
+                f"Saved final predictor "
+                f"to {save_path}"
+            )
+
         self.predictor_network.eval()
 
     def load_predictor(
