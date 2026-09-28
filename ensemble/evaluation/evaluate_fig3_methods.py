@@ -592,7 +592,7 @@ def build_method_scores(
         -u_nb_norm
 
     RM + NeuBoots:
-        r_norm
+        (1 - lambda_NB) * r_norm
         - lambda_NB * u_nb_norm
     """
 
@@ -734,12 +734,14 @@ def build_method_scores(
                 -normalized_nb_uncertainty
             )
 
+
         elif method == "rm_neuboots":
 
             scores[method] = (
-                normalized_rm
-                - neuboots_lambda
-                * normalized_nb_uncertainty
+                    (1.0 - neuboots_lambda)
+                    * normalized_rm
+                    - neuboots_lambda
+                    * normalized_nb_uncertainty
             )
 
         else:
@@ -1452,6 +1454,7 @@ def main():
 
             "rm_neuboots":
                 (
+                    "(1 - neuboots_lambda) * "
                     "normalized_reward "
                     "- neuboots_lambda * "
                     "normalized_neuboots_uncertainty"
