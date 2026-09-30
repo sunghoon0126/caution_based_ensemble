@@ -9,7 +9,9 @@ import numpy as np
 import torch
 from tqdm import tqdm
 
-from baseline.pessimism.datasets.gsm8k import GSM8KDataset
+from baseline.pessimism.datasets.gsm8k import (
+    GSM8KDataset,
+)
 from baseline.pessimism.models.openai_model import (
     run_openai_inference,
 )
@@ -18,10 +20,15 @@ from baseline.pessimism.models.rnd_reward_model import (
 )
 
 from ensemble.evaluation.score_gsm8k_neuboots import (
+    ALPHAS,
     load_predictor,
     score_batch,
 )
 
+
+# ============================================================
+# Logging
+# ============================================================
 
 logging.basicConfig(
     level=logging.INFO,
@@ -36,14 +43,27 @@ logging.basicConfig(
 logger = logging.getLogger(__name__)
 
 
+# ============================================================
+# Seed
+# ============================================================
+
 def set_seed(seed):
     random.seed(seed)
     np.random.seed(seed)
     torch.manual_seed(seed)
 
     if torch.cuda.is_available():
-        torch.cuda.manual_seed_all(seed)
+        torch.cuda.manual_seed_all(
+            seed
+        )
 
+
+# ============================================================
+# Calibration response generation
+#
+# Normally we will NOT use this for the current experiment,
+# because the existing held-out GSM8K responses are reused.
+# ============================================================
 
 def load_calibration_dataset(
         start_index,
@@ -125,8 +145,12 @@ def generate_responses(
 
         requests.append(
             {
-                "uuid": request_uuid,
-                "prompt": problem.prompt,
+                "uuid":
+                    request_uuid,
+
+                "prompt":
+                    problem.prompt,
+
                 "messages": [
                     {
                         "role": "user",
@@ -175,6 +199,10 @@ def generate_responses(
     return responses_file
 
 
+# ============================================================
+# Existing response loader
+# ============================================================
+
 def extract_prompt_response(item):
     request = item.get(
         "request",
@@ -195,7 +223,10 @@ def extract_prompt_response(item):
     )
 
     if (
-        not isinstance(prompt, str)
+        not isinstance(
+            prompt,
+            str,
+        )
         or not isinstance(
             response,
             str,
@@ -220,12 +251,17 @@ def load_pairs(path):
     ) as f:
 
         for line in f:
-            line = line.strip()
+
+            line = (
+                line.strip()
+            )
 
             if not line:
                 continue
 
-            item = json.loads(line)
+            item = json.loads(
+                line
+            )
 
             pair = (
                 extract_prompt_response(
@@ -236,10 +272,18 @@ def load_pairs(path):
             if pair is None:
                 continue
 
-            prompt, response = pair
+            (
+                prompt,
+                response,
+            ) = pair
 
-            prompts.append(prompt)
-            responses.append(response)
+            prompts.append(
+                prompt
+            )
+
+            responses.append(
+                response
+            )
 
     if not prompts:
         raise RuntimeError(
@@ -248,7 +292,8 @@ def load_pairs(path):
         )
 
     logger.info(
-        f"Loaded {len(prompts)} "
+        f"Loaded "
+        f"{len(prompts)} "
         f"calibration pairs"
     )
 
@@ -257,6 +302,10 @@ def load_pairs(path):
         responses,
     )
 
+
+# ============================================================
+# Main RM + original Caution RND
+# ============================================================
 
 def score_original_rnd(
         prompts,
@@ -275,34 +324,47 @@ def score_original_rnd(
         "r",
         encoding="utf-8",
     ) as f:
+
         config = json.load(f)
 
     model = RNDRewardModel(
         reward_model_path=(
             reward_model_path
         ),
-        target_layers=config[
-            "target_layers"
-        ],
-        predictor_layers=config[
-            "predictor_layers"
-        ],
-        rnd_weight=config.get(
-            "rnd_weight",
-            0.2,
+        target_layers=(
+            config[
+                "target_layers"
+            ]
+        ),
+        predictor_layers=(
+            config[
+                "predictor_layers"
+            ]
+        ),
+        rnd_weight=(
+            config.get(
+                "rnd_weight",
+                0.2,
+            )
         ),
         device=device,
-        exact_architecture=config.get(
-            "exact_architecture",
-            False,
+        exact_architecture=(
+            config.get(
+                "exact_architecture",
+                False,
+            )
         ),
-        embedding_strategy=config.get(
-            "embedding_strategy",
-            "shared_trainable",
+        embedding_strategy=(
+            config.get(
+                "embedding_strategy",
+                "shared_trainable",
+            )
         ),
-        use_projection=config.get(
-            "use_projection",
-            True,
+        use_projection=(
+            config.get(
+                "use_projection",
+                True,
+            )
         ),
     )
 
@@ -313,7 +375,10 @@ def score_original_rnd(
     reward_scores = []
     rnd_uncertainties = []
 
-    for prompt, response in tqdm(
+    for (
+        prompt,
+        response,
+    ) in tqdm(
         zip(
             prompts,
             responses,
@@ -335,21 +400,25 @@ def score_original_rnd(
             )
         )
 
-        # Caution returns:
+        # Caution convention:
         #
-        # rnd_score = - MSE
+        # rnd_score = -MSE
         #
-        # We want positive uncertainty.
+        # Convert to positive uncertainty.
         rnd_uncertainty = (
             -rnd_score
         )
 
         reward_scores.append(
-            reward_score
+            float(
+                reward_score
+            )
         )
 
         rnd_uncertainties.append(
-            rnd_uncertainty
+            float(
+                rnd_uncertainty
+            )
         )
 
     del model
@@ -365,65 +434,143 @@ def score_original_rnd(
     )
 
 
+# ============================================================
+# NeuBoots calibration scoring
+#
+# Returns:
+#
+#   mc_mean
+#   std
+#
+#   median_quantile[alpha]
+#   avg_quantile[alpha]
+#   avg_quantile_avg[alpha]
+#
+# Distance is computed later using:
+#
+#   |main RM - mc_mean|
+# ============================================================
+
 def score_neuboots(
         prompts,
         responses,
         checkpoint_dir,
         num_mc,
-        batch_size,
         device,
 ):
-    tokenizer, predictor = (
-        load_predictor(
-            checkpoint_dir=(
-                checkpoint_dir
-            ),
-            device=device,
-        )
+    (
+        tokenizer,
+        predictor,
+    ) = load_predictor(
+        checkpoint_dir=(
+            checkpoint_dir
+        ),
+        device=device,
     )
 
-    uncertainties = []
+    mc_means = []
 
-    for start in tqdm(
-        range(
-            0,
-            len(prompts),
-            batch_size,
+    std_values = []
+
+    median_quantile_values = {
+        f"{alpha:.1f}": []
+        for alpha in ALPHAS
+    }
+
+    avg_quantile_values = {
+        f"{alpha:.1f}": []
+        for alpha in ALPHAS
+    }
+
+    avg_quantile_avg_values = {
+        f"{alpha:.1f}": []
+        for alpha in ALPHAS
+    }
+
+    # score_batch() assumes one shared prompt
+    # for all responses in a batch.
+    #
+    # Calibration pairs have different prompts,
+    # so score them one pair at a time.
+    for (
+        prompt,
+        response,
+    ) in tqdm(
+        zip(
+            prompts,
+            responses,
         ),
+        total=len(prompts),
         desc="NeuBoots calibration scoring",
     ):
-        end = min(
-            start + batch_size,
-            len(prompts),
+        (
+            mc_mean,
+            mc_std,
+            median_quantile,
+            avg_quantile,
+            avg_quantile_avg,
+        ) = score_batch(
+            tokenizer=tokenizer,
+            predictor=predictor,
+            prompt=prompt,
+            responses=[
+                response
+            ],
+            num_mc=num_mc,
+            device=device,
+            alphas=ALPHAS,
         )
 
-        batch_prompts = (
-            prompts[start:end]
+        # One response was passed,
+        # therefore every returned list
+        # contains exactly one value.
+
+        mc_means.append(
+            float(
+                mc_mean[0]
+            )
         )
 
-        batch_responses = (
-            responses[start:end]
+        std_values.append(
+            float(
+                mc_std[0]
+            )
         )
 
-        # score_batch() currently expects
-        # one shared prompt for the batch,
-        # so calibration requires individual
-        # prompt-response pairs.
-        for prompt, response in zip(
-            batch_prompts,
-            batch_responses,
-        ):
-            _, mc_std = score_batch(
-                tokenizer=tokenizer,
-                predictor=predictor,
-                prompt=prompt,
-                responses=[response],
-                num_mc=num_mc,
-                device=device,
+        for alpha in ALPHAS:
+
+            alpha_key = (
+                f"{alpha:.1f}"
             )
 
-            uncertainties.append(
-                float(mc_std[0])
+            median_quantile_values[
+                alpha_key
+            ].append(
+                float(
+                    median_quantile[
+                        alpha_key
+                    ][0]
+                )
+            )
+
+            avg_quantile_values[
+                alpha_key
+            ].append(
+                float(
+                    avg_quantile[
+                        alpha_key
+                    ][0]
+                )
+            )
+
+            avg_quantile_avg_values[
+                alpha_key
+            ].append(
+                float(
+                    avg_quantile_avg[
+                        alpha_key
+                    ][0]
+                )
             )
 
     del predictor
@@ -433,8 +580,69 @@ def score_neuboots(
     if torch.cuda.is_available():
         torch.cuda.empty_cache()
 
-    return uncertainties
+    return {
+        "mc_mean":
+            mc_means,
 
+        "std":
+            std_values,
+
+        "median_quantile":
+            median_quantile_values,
+
+        "avg_quantile":
+            avg_quantile_values,
+
+        "avg_quantile_avg":
+            avg_quantile_avg_values,
+    }
+
+
+# ============================================================
+# Distance
+#
+#     |r_RM - ensemble mean|
+# ============================================================
+
+def compute_distance(
+        reward_scores,
+        mc_means,
+):
+    reward_array = np.asarray(
+        reward_scores,
+        dtype=np.float64,
+    )
+
+    mean_array = np.asarray(
+        mc_means,
+        dtype=np.float64,
+    )
+
+    if (
+        reward_array.shape
+        != mean_array.shape
+    ):
+        raise ValueError(
+            "Reward / NeuBoots mean "
+            "shape mismatch: "
+            f"{reward_array.shape} "
+            f"vs "
+            f"{mean_array.shape}"
+        )
+
+    distance = np.abs(
+        reward_array
+        - mean_array
+    )
+
+    return (
+        distance.tolist()
+    )
+
+
+# ============================================================
+# Save candidate-level calibration scores
+# ============================================================
 
 def save_calibration_scores(
         output_path,
@@ -442,14 +650,62 @@ def save_calibration_scores(
         responses,
         reward_scores,
         rnd_uncertainties,
-        neuboots_uncertainties,
+        neuboots_scores,
+        distance_values,
 ):
-    os.makedirs(
-        os.path.dirname(
-            output_path
-        ),
-        exist_ok=True,
+    output_dir = os.path.dirname(
+        output_path
     )
+
+    if output_dir:
+        os.makedirs(
+            output_dir,
+            exist_ok=True,
+        )
+
+    num_examples = len(
+        prompts
+    )
+
+    fields_to_check = {
+        "responses":
+            responses,
+
+        "reward_scores":
+            reward_scores,
+
+        "rnd_uncertainties":
+            rnd_uncertainties,
+
+        "mc_mean":
+            neuboots_scores[
+                "mc_mean"
+            ],
+
+        "std":
+            neuboots_scores[
+                "std"
+            ],
+
+        "distance":
+            distance_values,
+    }
+
+    for (
+        name,
+        values,
+    ) in fields_to_check.items():
+
+        if (
+            len(values)
+            != num_examples
+        ):
+            raise ValueError(
+                f"{name} length "
+                f"{len(values)} "
+                f"!= "
+                f"{num_examples}"
+            )
 
     with open(
         output_path,
@@ -458,31 +714,162 @@ def save_calibration_scores(
     ) as f:
 
         for i in range(
-            len(prompts)
+            num_examples
         ):
+            median_quantile = {}
+
+            avg_quantile = {}
+
+            avg_quantile_avg = {}
+
+            for alpha in ALPHAS:
+
+                alpha_key = (
+                    f"{alpha:.1f}"
+                )
+
+                median_quantile[
+                    alpha_key
+                ] = float(
+                    neuboots_scores[
+                        "median_quantile"
+                    ][
+                        alpha_key
+                    ][i]
+                )
+
+                avg_quantile[
+                    alpha_key
+                ] = float(
+                    neuboots_scores[
+                        "avg_quantile"
+                    ][
+                        alpha_key
+                    ][i]
+                )
+
+                avg_quantile_avg[
+                    alpha_key
+                ] = float(
+                    neuboots_scores[
+                        "avg_quantile_avg"
+                    ][
+                        alpha_key
+                    ][i]
+                )
+
             item = {
-                "calibration_index": i,
-                "prompt": prompts[i],
-                "response": responses[i],
-                "reward_score": float(
-                    reward_scores[i]
-                ),
-                "rnd_uncertainty": float(
-                    rnd_uncertainties[i]
-                ),
-                "neuboots_uncertainty": float(
-                    neuboots_uncertainties[i]
-                ),
+                "calibration_index":
+                    i,
+
+                "prompt":
+                    prompts[i],
+
+                "response":
+                    responses[i],
+
+                # --------------------------------------------
+                # Main RM
+                # --------------------------------------------
+
+                "reward_score":
+                    float(
+                        reward_scores[i]
+                    ),
+
+                # --------------------------------------------
+                # Original Caution uncertainty
+                # --------------------------------------------
+
+                "rnd_uncertainty":
+                    float(
+                        rnd_uncertainties[i]
+                    ),
+
+                # --------------------------------------------
+                # NeuBoots ensemble mean
+                # --------------------------------------------
+
+                "neuboots_mc_mean":
+                    float(
+                        neuboots_scores[
+                            "mc_mean"
+                        ][i]
+                    ),
+
+                # --------------------------------------------
+                # 1. STD
+                # --------------------------------------------
+
+                "neuboots_uncertainty_std":
+                    float(
+                        neuboots_scores[
+                            "std"
+                        ][i]
+                    ),
+
+                # Backward compatibility:
+                # old code interprets this as STD.
+                "neuboots_uncertainty":
+                    float(
+                        neuboots_scores[
+                            "std"
+                        ][i]
+                    ),
+
+                # --------------------------------------------
+                # 2. Distance
+                #
+                # |RM - ensemble mean|
+                # --------------------------------------------
+
+                "neuboots_uncertainty_distance":
+                    float(
+                        distance_values[i]
+                    ),
+
+                # --------------------------------------------
+                # 3. Median - Quantile
+                # --------------------------------------------
+
+                "neuboots_uncertainty_median_quantile":
+                    median_quantile,
+
+                # --------------------------------------------
+                # 4. Average - Quantile
+                # --------------------------------------------
+
+                "neuboots_uncertainty_avg_quantile":
+                    avg_quantile,
+
+                # --------------------------------------------
+                # 5. Average - Quantile's Average
+                # --------------------------------------------
+
+                "neuboots_uncertainty_avg_quantile_avg":
+                    avg_quantile_avg,
             }
 
             f.write(
-                json.dumps(item)
+                json.dumps(
+                    item
+                )
                 + "\n"
             )
 
 
+# ============================================================
+# Main
+# ============================================================
+
 def main():
+
     parser = argparse.ArgumentParser()
+
+    # --------------------------------------------------------
+    # Only needed when generating a new calibration set.
+    # For the current experiment we reuse --responses-file.
+    # --------------------------------------------------------
 
     parser.add_argument(
         "--start-index",
@@ -499,13 +886,13 @@ def main():
     parser.add_argument(
         "--inference-config",
         type=str,
-        required=True,
+        default=None,
     )
 
     parser.add_argument(
         "--generation-output-dir",
         type=str,
-        required=True,
+        default=None,
     )
 
     parser.add_argument(
@@ -513,6 +900,10 @@ def main():
         type=str,
         default=None,
     )
+
+    # --------------------------------------------------------
+    # Models
+    # --------------------------------------------------------
 
     parser.add_argument(
         "--reward-model-path",
@@ -535,17 +926,30 @@ def main():
         required=True,
     )
 
+    # --------------------------------------------------------
+    # NeuBoots MC
+    # --------------------------------------------------------
+
     parser.add_argument(
         "--num-mc",
         type=int,
         default=20,
     )
 
+    # Kept for CLI compatibility.
+    #
+    # Current calibration implementation scores
+    # one prompt-response pair at a time because
+    # score_batch() assumes a shared prompt.
     parser.add_argument(
         "--batch-size",
         type=int,
         default=32,
     )
+
+    # --------------------------------------------------------
+    # Environment
+    # --------------------------------------------------------
 
     parser.add_argument(
         "--device",
@@ -567,19 +971,40 @@ def main():
 
     args = parser.parse_args()
 
+    if args.num_mc <= 0:
+        raise ValueError(
+            "--num-mc must be positive."
+        )
+
     set_seed(
         args.seed
     )
 
-    # --------------------------------------------------
-    # 1. Generate independent responses
-    # --------------------------------------------------
+    # ========================================================
+    # 1. Reuse existing calibration responses
+    #    or generate new ones if explicitly requested.
+    # ========================================================
 
     responses_file = (
         args.responses_file
     )
 
     if responses_file is None:
+
+        if args.inference_config is None:
+            raise ValueError(
+                "--inference-config is required "
+                "when --responses-file is not provided."
+            )
+
+        if (
+            args.generation_output_dir
+            is None
+        ):
+            raise ValueError(
+                "--generation-output-dir is required "
+                "when --responses-file is not provided."
+            )
 
         dataset = (
             load_calibration_dataset(
@@ -598,6 +1023,7 @@ def main():
             "r",
             encoding="utf-8",
         ) as f:
+
             inference_config = (
                 json.load(f)
             )
@@ -614,9 +1040,9 @@ def main():
             )
         )
 
-    # --------------------------------------------------
-    # 2. Load calibration pairs
-    # --------------------------------------------------
+    # ========================================================
+    # 2. Load calibration prompt-response pairs
+    # ========================================================
 
     (
         prompts,
@@ -625,9 +1051,9 @@ def main():
         responses_file
     )
 
-    # --------------------------------------------------
-    # 3. Original RM + RND
-    # --------------------------------------------------
+    # ========================================================
+    # 3. Main RM + original RND
+    # ========================================================
 
     (
         reward_scores,
@@ -644,26 +1070,48 @@ def main():
         device=args.device,
     )
 
-    # --------------------------------------------------
+    # ========================================================
     # 4. NeuBoots
-    # --------------------------------------------------
+    # ========================================================
 
-    neuboots_uncertainties = (
+    neuboots_scores = (
         score_neuboots(
             prompts=prompts,
             responses=responses,
             checkpoint_dir=(
                 args.neuboots_checkpoint_dir
             ),
-            num_mc=args.num_mc,
-            batch_size=args.batch_size,
-            device=args.device,
+            num_mc=(
+                args.num_mc
+            ),
+            device=(
+                args.device
+            ),
         )
     )
 
-    # --------------------------------------------------
-    # 5. Save
-    # --------------------------------------------------
+    # ========================================================
+    # 5. Distance
+    #
+    # |main RM - NeuBoots ensemble mean|
+    # ========================================================
+
+    distance_values = (
+        compute_distance(
+            reward_scores=(
+                reward_scores
+            ),
+            mc_means=(
+                neuboots_scores[
+                    "mc_mean"
+                ]
+            ),
+        )
+    )
+
+    # ========================================================
+    # 6. Save
+    # ========================================================
 
     save_calibration_scores(
         output_path=(
@@ -677,20 +1125,58 @@ def main():
         rnd_uncertainties=(
             rnd_uncertainties
         ),
-        neuboots_uncertainties=(
-            neuboots_uncertainties
+        neuboots_scores=(
+            neuboots_scores
+        ),
+        distance_values=(
+            distance_values
         ),
     )
 
     print()
     print(
-        f"Saved calibration scores: "
-        f"{args.output_path}"
+        "Saved calibration scores:"
+    )
+
+    print(
+        f"  {args.output_path}"
     )
 
     print(
         f"Number of calibration pairs: "
         f"{len(prompts)}"
+    )
+
+    print(
+        "NeuBoots metrics:"
+    )
+
+    print(
+        "  1. std"
+    )
+
+    print(
+        "  2. distance"
+    )
+
+    print(
+        "  3. median_quantile"
+    )
+
+    print(
+        "  4. avg_quantile"
+    )
+
+    print(
+        "  5. avg_quantile_avg"
+    )
+
+    print(
+        "alphas:",
+        [
+            f"{alpha:.1f}"
+            for alpha in ALPHAS
+        ],
     )
 
 
