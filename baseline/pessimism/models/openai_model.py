@@ -28,6 +28,7 @@ class OpenAIClient:
         max_error_count: Optional[int] = 100,
         trial_run=False,
         dump_individual_rsp=True,
+        write_aggregate_rsp=True,
     ):
         self.output_path = output_path
         self.trial_run = trial_run
@@ -81,6 +82,7 @@ class OpenAIClient:
 
         self.response_queue = asyncio.Queue()
         self.dump_individual_rsp = dump_individual_rsp
+        self.write_aggregate_rsp = write_aggregate_rsp
 
         if generation_config is None:
             self.generation_config = {
@@ -126,7 +128,8 @@ class OpenAIClient:
                         print(save_path)
                         raise Exception(f"Error loading response from file: {save_path}")
 
-                await self.response_queue.put(rsp_content)
+                if self.write_aggregate_rsp:
+                    await self.response_queue.put(rsp_content)
                 return f"Skipping {save_path}"
 
         if "generation_config" in request_dict and isinstance(
@@ -183,7 +186,10 @@ class OpenAIClient:
                     indent=2,
                 )
 
-        await self.response_queue.put({"request": request_dict, "response": response})
+        if self.write_aggregate_rsp:
+            await self.response_queue.put(
+                {"request": request_dict, "response": response}
+            )
 
         return response["choices"][0]["message"]["content"]
 
@@ -244,11 +250,14 @@ class AsyncRateLimitThreadPool:
 
 async def run_pool(api, requests, num_workers, num_requests, period):
     pool = AsyncRateLimitThreadPool(num_workers, num_requests, period)
-    writer_task = asyncio.create_task(api.write_responses_to_file())
+    writer_task = None
+    if api.write_aggregate_rsp:
+        writer_task = asyncio.create_task(api.write_responses_to_file())
 
     results = await pool.map(api.query, requests)
-    await api.response_queue.join()  # Ensure all responses are written
-    writer_task.cancel()
+    if writer_task is not None:
+        await api.response_queue.join()  # Ensure all responses are written
+        writer_task.cancel()
 
     return results
 
@@ -271,6 +280,8 @@ def run_openai_inference(
     max_error_count: Optional[int] = 100,
     trial_run=False,
     dump_individual_rsp=True,
+    reset_output_file=True,
+    write_aggregate_rsp=True,
 ):
     logging.getLogger(__name__).info(
         f"num_requests: {len(requests)}, output_path: {output_path}"
@@ -282,7 +293,12 @@ def run_openai_inference(
     if dump_individual_rsp:
         os.makedirs(os.path.join(output_path, "responses"), exist_ok=True)
 
-    if os.path.exists(os.path.join(output_path, "all_responses.jsonl")):
+    if (
+        reset_output_file
+        and os.path.exists(
+            os.path.join(output_path, "all_responses.jsonl")
+        )
+    ):
         os.remove(os.path.join(output_path, "all_responses.jsonl"))
 
     client = OpenAIClient(
@@ -296,6 +312,7 @@ def run_openai_inference(
         generation_config=generation_config,
         trial_run=trial_run,
         dump_individual_rsp=dump_individual_rsp,
+        write_aggregate_rsp=write_aggregate_rsp,
     )
 
     try:
