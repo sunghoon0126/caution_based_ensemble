@@ -1,0 +1,17 @@
+{
+  "description": "Documented sanity configuration; CLI is authoritative. learning_rate must be explicitly chosen.",
+  "dataset": "gsm8k",
+  "limit_problems": 10,
+  "num_samples": 16,
+  "seed": 42,
+  "reward_model": "OpenAssistant/reward-model-deberta-v3-large-v2",
+  "dummy_mode": "fixed_min",
+  "learning_rate": null,
+  "num_sgd_steps": 1,
+  "optimizer": "sgd",
+  "momentum": 0,
+  "weight_decay": 0,
+  "update_scope": "full",
+  "loss": "half_mse",
+  "dtype": "float32"
+}
