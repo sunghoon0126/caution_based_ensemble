@@ -1,13 +1,11 @@
 #!/usr/bin/env python3
-"""Score freshly generated reference-likelihood candidates with the original Caution RM.
+"""Score reference-likelihood candidates with a pair or chat scalar RM.
 
 Input: canonical generated_candidates.jsonl (one candidate per line).
 Output: scored_candidates.jsonl, preserving source order and adding RM logits.
 
-No RND/NeuBoots predictor is loaded or trained. The prompt/response pair is
-scored exactly as in RNDRewardModel.compute_reward_score():
-    tokenizer(prompt, response, truncation=True)
-    reward_model(**tokenized).logits
+The default DeBERTa backend preserves Caution pair tokenization. Skywork uses
+its checkpoint's chat template and returns a single sequence-classifier logit.
 
 Batching pads only within a batch and passes attention masks. Completed output
 must be an exact prefix of the input, allowing safe resume after interruption.
@@ -23,8 +21,7 @@ import math
 from pathlib import Path
 from typing import Any, Dict, Iterator, List, Optional, TextIO
 
-import torch
-from transformers import AutoModelForSequenceClassification, AutoTokenizer
+from ensemble.models.scalar_reward_inputs import resolve_backend, tokenize_rewards
 
 LOG = logging.getLogger("reference_rm_scoring")
 DEFAULT_REWARD_MODEL = "OpenAssistant/reward-model-deberta-v3-large-v2"
@@ -56,6 +53,10 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--input-path", type=Path, required=True)
     parser.add_argument("--output-path", type=Path, required=True)
     parser.add_argument("--reward-model", default=DEFAULT_REWARD_MODEL)
+    parser.add_argument("--reward-backend", choices=("auto", "pair", "skywork"), default="auto")
+    parser.add_argument("--dtype", choices=("auto", "float32", "float16", "bfloat16"), default="auto")
+    parser.add_argument("--max-length", type=int, default=None, help="RM input limit; Skywork defaults to 16384 and rejects overlong inputs")
+    parser.add_argument("--revision", default="main", help="Reward model/tokenizer checkpoint revision")
     parser.add_argument("--device", default="cuda:0")
     parser.add_argument("--batch-size", type=int, default=16)
     parser.add_argument("--max-candidates", type=int, default=None,
@@ -95,6 +96,7 @@ def match_completed_prefix(
     compact: bool,
     max_candidates: Optional[int],
     input_path: Path,
+    scoring_config=None,
 ) -> int:
     """Consume the completed output prefix and the corresponding input lines."""
     if not output_path.exists():
@@ -132,6 +134,8 @@ def match_completed_prefix(
                     f"Resume reward-model mismatch at row {completed}: "
                     f"{scored.get('reward_model_path')!r}"
                 )
+            if scoring_config is not None and scored.get("reward_scoring_config") != scoring_config:
+                raise ValueError("Resume scoring settings differ; use a separate output path")
             if ("response" not in scored) != compact:
                 raise ValueError("Resume output format differs from --compact")
             score = scored.get("reward_model_score")
@@ -140,22 +144,34 @@ def match_completed_prefix(
     return completed
 
 
-def load_reward_model(model_name: str, device: str):
+def load_reward_model(model_name: str, device: str, scoring_config=None):
+    import torch
+    from transformers import AutoModelForSequenceClassification, AutoTokenizer
+    settings = scoring_config or {"backend": "pair", "dtype": "auto", "max_length": None, "revision": "main"}
     tokenizer = AutoTokenizer.from_pretrained(
         model_name,
         use_fast=True,
-        trust_remote_code=True,
+        revision=settings["revision"],
     )
+    dtype = settings["dtype"]
+    model_kwargs = {"num_labels": 1} if settings["backend"] == "skywork" else {}
     model = AutoModelForSequenceClassification.from_pretrained(
         model_name,
-        trust_remote_code=True,
+        revision=settings["revision"],
+        torch_dtype="auto" if dtype == "auto" else getattr(torch, dtype),
+        **model_kwargs,
     ).to(device)
     model.eval()
     if tokenizer.pad_token is None:
         if tokenizer.eos_token is None:
             raise ValueError("Model tokenizer has neither pad_token nor eos_token")
         tokenizer.pad_token = tokenizer.eos_token
-        model.config.pad_token_id = tokenizer.pad_token_id
+    model.config.pad_token_id = tokenizer.pad_token_id
+    if settings["backend"] == "skywork":
+        tokenizer.padding_side = "right"
+        if not tokenizer.chat_template:
+            raise ValueError("Skywork tokenizer has no chat template")
+    model.reference_scoring_config = settings
     if model.config.num_labels != 1:
         raise ValueError(
             f"Expected a scalar reward model (num_labels=1), got "
@@ -164,27 +180,15 @@ def load_reward_model(model_name: str, device: str):
     return tokenizer, model
 
 
-@torch.inference_mode()
 def score_batch(tokenizer, model, records: List[Dict[str, Any]], device: str) -> List[float]:
-    prompts = []
-    responses = []
-    for r in records:
-        if not isinstance(r.get("prompt"), str) or not isinstance(r.get("response"), str):
-            raise ValueError(f"Candidate {r.get('candidate_id')}: prompt/response must be strings")
-        prompts.append(r["prompt"])
-        responses.append(r["response"])
-
-    # Matches Caution's tokenizer(prompt, response, truncation=True).
-    # Padding is added only to make batched inference possible.
-    tokenized = tokenizer(
-        prompts,
-        responses,
-        padding=True,
-        truncation=True,
-        return_tensors="pt",
+    import torch
+    settings = model.reference_scoring_config
+    tokenized = tokenize_rewards(
+        tokenizer, records, settings["backend"], settings["max_length"],
     )
     tokenized = {name: tensor.to(device) for name, tensor in tokenized.items()}
-    logits = model(**tokenized).logits
+    with torch.inference_mode():
+        logits = model(**tokenized).logits
     values = logits.reshape(len(records), -1)
     if values.shape[1] != 1:
         raise ValueError(f"Expected one reward per candidate, got {tuple(values.shape)}")
@@ -211,6 +215,8 @@ def write_batch(
         )
         row["response_sha256"] = sha_for_record(record)
         row["reward_model_path"] = reward_model_name
+        row["reward_scoring_config"] = model.reference_scoring_config
+        row["reward_model_revision"] = getattr(model.config, "_commit_hash", None)
         row["reward_model_score"] = score
         dest.write(json.dumps(row, ensure_ascii=False, allow_nan=False) + "\n")
     dest.flush()
@@ -218,6 +224,14 @@ def write_batch(
 
 
 def run(args: argparse.Namespace) -> None:
+    if args.max_length is not None and args.max_length <= 0:
+        raise ValueError("--max-length must be positive")
+    scoring_config = {
+        "backend": resolve_backend(args.reward_model, args.reward_backend),
+        "dtype": args.dtype,
+        "max_length": args.max_length,
+        "revision": args.revision,
+    }
     if args.batch_size <= 0 or args.log_every <= 0:
         raise ValueError("--batch-size and --log-every must be positive")
     if args.max_candidates is not None and args.max_candidates <= 0:
@@ -240,6 +254,7 @@ def run(args: argparse.Namespace) -> None:
             args.compact,
             args.max_candidates,
             source_path,
+            scoring_config,
         )
         LOG.info("Completed prefix: %d candidates", already_done)
         if args.max_candidates is not None and already_done >= args.max_candidates:
@@ -253,7 +268,7 @@ def run(args: argparse.Namespace) -> None:
         first_row = decode_line(first_pending, source_path, already_done + 1)
         if not first_row.get("candidate_id"):
             raise ValueError("Missing candidate_id")
-        tokenizer, model = load_reward_model(args.reward_model, args.device)
+        tokenizer, model = load_reward_model(args.reward_model, args.device, scoring_config)
 
         buffer = [first_row]
         processed = 0

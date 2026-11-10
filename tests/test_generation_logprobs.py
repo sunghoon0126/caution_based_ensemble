@@ -5,7 +5,9 @@ from baseline.pessimism.models.generation_logprobs import (
     summarize_choice_logprobs,
 )
 from ensemble.generation.generate_reference_candidates import (
+    build_prompt_config,
     canonicalize_record,
+    resolve_max_tokens,
 )
 
 
@@ -133,6 +135,47 @@ class CanonicalizeRecordTest(unittest.TestCase):
         self.assertEqual(result["trial_id"], 1)
         self.assertEqual(result["token_count"], 1)
         self.assertAlmostEqual(result["sequence_probability"], 0.8)
+
+
+class DatasetPromptConfigTest(unittest.TestCase):
+    def test_gsm8k_requires_a_numerical_final_answer(self):
+        prompt = build_prompt_config("gsm8k")["system_prompt"]
+
+        self.assertIn("numerical answer", prompt)
+        self.assertIn("#### {NUM}", prompt)
+
+    def test_math500_accepts_non_numeric_math_answers(self):
+        prompt = build_prompt_config("math500")["system_prompt"]
+
+        self.assertIn("mathematical answer", prompt)
+        self.assertIn("expression", prompt)
+        self.assertIn("LaTeX", prompt)
+        self.assertNotIn("{NUM}", prompt)
+
+    def test_bbh_preserves_the_tasks_answer_format(self):
+        prompt = build_prompt_config("bbh")["system_prompt"]
+
+        self.assertIn("Preserve the answer format", prompt)
+        self.assertIn("#### (A)", prompt)
+        self.assertNotIn("{NUM}", prompt)
+
+    def test_unknown_dataset_is_rejected(self):
+        with self.assertRaisesRegex(ValueError, "Unsupported dataset prompt"):
+            build_prompt_config("unknown")
+
+
+class DatasetMaxTokensTest(unittest.TestCase):
+    def test_dataset_defaults(self):
+        self.assertEqual(resolve_max_tokens("gsm8k"), 500)
+        self.assertEqual(resolve_max_tokens("math500"), 1024)
+        self.assertEqual(resolve_max_tokens("bbh"), 1024)
+
+    def test_cli_value_overrides_dataset_default(self):
+        self.assertEqual(resolve_max_tokens("gsm8k", 1536), 1536)
+
+    def test_non_positive_override_is_rejected(self):
+        with self.assertRaisesRegex(ValueError, "must be positive"):
+            resolve_max_tokens("math500", 0)
 
 
 if __name__ == "__main__":

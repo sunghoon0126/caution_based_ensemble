@@ -29,6 +29,28 @@ python -m ensemble.generation.generate_reference_candidates \
 For the full 512-candidate run, remove `--limit-problems` and set
 `--num-samples 512`.
 
+MATH-500 and BBH use dataset-specific final-answer instructions rather than
+the GSM8K-only `#### {NUM}` instruction. Generation defaults to 500 completion
+tokens for GSM8K and 1,024 for MATH-500 and BBH:
+
+```bash
+bash scripts/run_math500_bbh_trial1.sh
+```
+
+The script writes to `outputs/reference_generation_promptfix_1024` by default
+so that responses generated with the old prompt are never resumed silently.
+The location and token limit can be changed explicitly:
+
+```bash
+REFERENCE_GENERATION_ROOT=outputs/my_reference_run \
+MAX_TOKENS=1536 \
+bash scripts/run_math500_bbh_trial1.sh
+```
+
+For a direct invocation, pass `--max-tokens 1024`; this overrides only the
+loaded inference config for that run and is recorded in every candidate's
+`generation_config`.
+
 ## Outputs
 
 - `responses/<candidate_id>.json`: resumable raw API response, including the

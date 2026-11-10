@@ -22,24 +22,88 @@ logging.basicConfig(
 logger = logging.getLogger(__name__)
 
 SCHEMA_VERSION = 1
+DEFAULT_MAX_TOKENS = {
+    "gsm8k": 500,
+    "math500": 1024,
+    "bbh": 1024,
+    "logiqa2": 1024,
+    "arc_challenge": 1024,
+}
 
-
-def build_prompt_config() -> Dict[str, Any]:
-    return {
+PROMPT_CONFIGS: Dict[str, Dict[str, Any]] = {
+    "gsm8k": {
         "system_prompt": (
             "Solve the following problem step by step. "
-            "Give your final numerical answer at the end with: "
-            "#### {NUM}"
+            "Give your final numerical answer at the end with exactly "
+            "this format: #### {NUM}"
         ),
         "add_generation_prompt": True,
-    }
+    },
+    "math500": {
+        "system_prompt": (
+            "Solve the following mathematics problem step by step. "
+            "Keep mathematical notation precise. End your response with "
+            "exactly one final answer line in this format: "
+            "#### {ANSWER}. Replace {ANSWER} with the final mathematical "
+            "answer, which may be a number, expression, or LaTeX formula."
+        ),
+        "add_generation_prompt": True,
+    },
+    "bbh": {
+        "system_prompt": (
+            "Solve the following reasoning task carefully. The answer may "
+            "be a multiple-choice label, word, boolean, number, expression, "
+            "or sequence. End your response with exactly one final answer "
+            "line in this format: #### {ANSWER}. Replace {ANSWER} with only "
+            "the requested answer. Preserve the answer format used by the "
+            "problem; for example, if choices are labeled (A), (B), and so "
+            "on, write #### (A)."
+        ),
+        "add_generation_prompt": True,
+    },
+}
+
+
+def build_prompt_config(dataset_name: str) -> Dict[str, Any]:
+    try:
+        return PROMPT_CONFIGS[dataset_name].copy()
+    except KeyError as error:
+        raise ValueError(
+            f"Unsupported dataset prompt: {dataset_name}"
+        ) from error
+
+
+def resolve_max_tokens(
+    dataset_name: str,
+    override: Optional[int] = None,
+) -> int:
+    if override is not None:
+        if override <= 0:
+            raise ValueError("--max-tokens must be positive")
+        return override
+
+    try:
+        return DEFAULT_MAX_TOKENS[dataset_name]
+    except KeyError as error:
+        raise ValueError(
+            f"Unsupported dataset max-token default: {dataset_name}"
+        ) from error
 
 
 def load_dataset(
     dataset_name: str,
     split: str,
     seed: int,
+    data_dir=None,
+    revision="main",
+    shuffle_problems=False,
 ):
+    if dataset_name in ("logiqa2", "arc_challenge"):
+        from baseline.pessimism.datasets.reasoning_choice import ReasoningChoiceDataset
+        return ReasoningChoiceDataset(
+            dataset_name, split=split, seed=seed, data_dir=data_dir,
+            revision=revision, shuffle_before_limit=shuffle_problems,
+        )
     from baseline.pessimism.datasets.bbh import BBHDataset
     from baseline.pessimism.datasets.gsm8k import GSM8KDataset
     from baseline.pessimism.datasets.mathgsm import MathGSMDataset
@@ -49,7 +113,7 @@ def load_dataset(
         "split": split,
         "fewshot_num": 0,
         "limit_problems": None,
-        "prompt_postprocessor_config": build_prompt_config(),
+        "prompt_postprocessor_config": build_prompt_config(dataset_name),
     }
 
     if dataset_name == "gsm8k":
@@ -246,6 +310,21 @@ def write_canonical_records(
     os.replace(temporary_path, output_path)
 
 
+def validate_cached_requests(responses_dir, requests):
+    """Do not resume old responses under changed prompts or token limits."""
+    for request in requests:
+        path = responses_dir / f"{request['uuid']}.json"
+        if not path.exists():
+            continue
+        with path.open(encoding="utf-8") as source:
+            stored = json.load(source)["request"]
+        for key in ("candidate_id", "messages", "generation_config"):
+            if stored.get(key) != request.get(key):
+                raise ValueError(
+                    f"Cached request differs in {key}: {path}. Use a new output directory."
+                )
+
+
 def select_problems(
     dataset,
     start_index: int,
@@ -278,7 +357,7 @@ def main() -> None:
     parser.add_argument(
         "--dataset",
         required=True,
-        choices=["gsm8k", "math500", "bbh"],
+        choices=["gsm8k", "math500", "bbh", "logiqa2", "arc_challenge"],
     )
     parser.add_argument("--split", default="test")
     parser.add_argument("--trial-id", type=int, default=1)
@@ -290,6 +369,17 @@ def main() -> None:
     parser.add_argument("--request-chunk-size", type=int, default=10000)
     parser.add_argument("--sample-seed-base", type=int, default=None)
     parser.add_argument("--seed", type=int, default=2)
+    parser.add_argument("--dataset-data-dir", type=Path, help="Local official LogiQA train/dev/test.txt directory")
+    parser.add_argument("--dataset-revision", default="main", help="Dataset source commit/revision")
+    parser.add_argument("--shuffle-problems", action="store_true", help="Seeded shuffle for new choice datasets before slicing")
+    parser.add_argument(
+        "--max-tokens",
+        type=int,
+        default=None,
+        help=(
+            "Override dataset token limit (GSM8K: 500; other datasets: 1024)."
+        ),
+    )
     args = parser.parse_args()
 
     from baseline.pessimism.models.openai_model import (
@@ -314,6 +404,14 @@ def main() -> None:
     generation_config = inference_kwargs.get(
         "generation_config", {}
     ).copy()
+    max_tokens = resolve_max_tokens(args.dataset, args.max_tokens)
+    generation_config["max_tokens"] = max_tokens
+    logger.info(
+        "Using max_tokens=%d for dataset=%s%s",
+        max_tokens,
+        args.dataset,
+        " (CLI override)" if args.max_tokens is not None else " (default)",
+    )
     if generation_config.get("logprobs") is not True:
         raise ValueError(
             "generation_config.logprobs must be true"
@@ -340,6 +438,9 @@ def main() -> None:
         dataset_name=args.dataset,
         split=args.split,
         seed=args.seed,
+        data_dir=args.dataset_data_dir,
+        revision=args.dataset_revision,
+        shuffle_problems=args.shuffle_problems,
     )
     selected = select_problems(
         dataset=dataset,
@@ -372,6 +473,7 @@ def main() -> None:
             chunk_index,
             len(requests),
         )
+        validate_cached_requests(args.output_dir / "responses", requests)
         run_openai_inference(
             requests=requests,
             reset_output_file=first_chunk,

@@ -260,6 +260,10 @@ def plot_length_distribution(path, length_counts, bin_width=20):
 
 def main():
     parser = argparse.ArgumentParser()
+    parser.add_argument("--selection-config", type=Path,
+                        help="Frozen validation lambda JSON from prepare_reference_selection tune")
+    parser.add_argument("--lambda-space", choices=("raw", "normalized"), default="raw",
+                        help="Use normalized for lambdas selected with prepare_reference_selection")
     parser.add_argument(
         "--input-paths",
         type=Path,
@@ -295,6 +299,15 @@ def main():
         help="Independent calibration stats (optional)",
     )
     args = parser.parse_args()
+    selection = None
+    if args.selection_config:
+        with args.selection_config.open() as source:
+            selection = json.load(source)
+        if selection.get("split") != "validation" or selection.get("lambda_space") != "normalized":
+            raise ValueError("Selection config must come from normalized validation tuning")
+        args.seq_lambda = selection["seq_lambda"]
+        args.avg_lambda = selection["avg_lambda"]
+        args.lambda_space = "normalized"
 
     if args.expected_candidates <= 0:
         raise ValueError("expected-candidates must be positive")
@@ -304,13 +317,23 @@ def main():
             raise ValueError("Lambda must be finite and nonnegative")
 
     stats = load_stats(args.normalization_stats)
+    if selection is not None and (stats is None or "metadata" not in stats):
+        raise ValueError("Selection config requires calibration stats with provenance")
+    if stats is not None and "metadata" in stats:
+        from ensemble.evaluation.prepare_reference_selection import inspect_inputs
+        identity = inspect_inputs(args.input_paths, "test")
+        for key, value in identity.items():
+            if stats["metadata"].get(key) != value or (selection is not None and selection.get(key) != value):
+                raise ValueError(f"Evaluation/calibration/selection mismatch: {key}")
 
     seq_lambda = args.seq_lambda
     avg_lambda = args.avg_lambda
 
     # Convert raw lambdas so normalization preserves the
     # original candidate rankings.
-    if stats is not None:
+    if args.lambda_space == "normalized" and stats is None:
+        raise ValueError("Normalized lambdas require --normalization-stats")
+    if stats is not None and args.lambda_space == "raw":
         reward_std = stats["reward"]["std"]
         seq_lambda *= (
             stats["sequence_nll"]["std"] / reward_std
@@ -338,6 +361,7 @@ def main():
     accuracy_sums = defaultdict(int)
     length_sums = defaultdict(int)
     length_counts = Counter()
+    oracle_counts = Counter()
     num_problems = 0
 
     for group in read_groups(
@@ -348,10 +372,12 @@ def main():
         best_scores = {m: -math.inf for m in METHODS}
         best_correct = {m: 0 for m in METHODS}
         best_length = {m: 0 for m in METHODS}
+        oracle_correct = 0
 
         for index, candidate in enumerate(group, start=1):
             _, _, _, length, correct = candidate
             length_counts[length] += 1
+            oracle_correct = max(oracle_correct, correct)
 
             scores = make_scores(
                 candidate, seq_lambda, avg_lambda, stats
@@ -365,6 +391,7 @@ def main():
                     best_length[method] = length
 
             if index in n_set:
+                oracle_counts[index] += oracle_correct
                 for method in METHODS:
                     accuracy_sums[(method, index)] += (
                         best_correct[method]
@@ -384,6 +411,12 @@ def main():
 
     output = args.output_dir
     output.mkdir(parents=True, exist_ok=True)
+    oracle_rows = [{"N": n, "pass_at_n": oracle_counts[n] / num_problems,
+                    "accuracy_percent": 100 * oracle_counts[n] / num_problems} for n in n_values]
+    write_csv(output / "oracle_pass_at_n.csv", ["N", "pass_at_n", "accuracy_percent"], oracle_rows)
+    save_line_plot(output / "oracle_pass_at_n.png", n_values,
+                   {"oracle": [r["accuracy_percent"] for r in oracle_rows]},
+                   "Accuracy (%)", "Oracle Pass@N (candidate prefixes)")
 
     accuracy_curves = {}
     length_curves = {}
@@ -504,6 +537,8 @@ def main():
     )
 
     metadata = {
+        "lambda_space": args.lambda_space,
+        "selection_config": str(args.selection_config) if args.selection_config else None,
         "num_problems": num_problems,
         "num_candidates": total,
         "raw_seq_lambda": args.seq_lambda,

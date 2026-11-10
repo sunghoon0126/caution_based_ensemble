@@ -8,8 +8,9 @@ export PYTHONPATH=.
 CONFIG0="configs/llama32_3b_generation_with_logprobs.json"
 CONFIG1="configs/llama32_3b_generation_gpu1.json"
 
-ROOT="outputs/reference_generation"
+ROOT="${REFERENCE_GENERATION_ROOT:-outputs/reference_generation_promptfix_1024}"
 LOG_DIR="logs/reference_generation"
+MAX_TOKENS="${MAX_TOKENS:-1024}"
 
 mkdir -p "$LOG_DIR"
 
@@ -33,6 +34,7 @@ echo "Starting MATH-500 and BBH generation"
     --request-chunk-size 10000 \
     --sample-seed-base 100000 \
     --seed 2 \
+    --max-tokens "$MAX_TOKENS" \
     2>&1 | tee "$LOG_DIR/math500_trial1.log"
 ) &
 PID0=$!
@@ -51,6 +53,7 @@ PID0=$!
     --request-chunk-size 10000 \
     --sample-seed-base 100000 \
     --seed 2 \
+    --max-tokens "$MAX_TOKENS" \
     2>&1 | tee "$LOG_DIR/bbh_trial1.log"
 ) &
 PID1=$!
