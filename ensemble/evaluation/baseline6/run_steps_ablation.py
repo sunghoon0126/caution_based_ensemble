@@ -21,6 +21,43 @@ from ensemble.evaluation.baseline6.reward_model_adapter import RewardModelAdapte
 DEFAULT_STEPS = (1, 2, 4, 8)
 
 
+class StepResumeWriter(ResumeWriter):
+    """Support already-written step_scores.jsonl rows without reward_after.
+
+    The original ResumeWriter requires reward_after when verifying completed
+    rows. Earlier Test 1 output stored scores_by_step instead. Normalize
+    those rows in memory while streaming; never rewrite or discard results.
+    """
+
+    def __init__(self, path, config):
+        super().__init__(path, config)
+        step_keys = tuple(str(step) for step in config["steps"])
+        original_rows = self.existing
+
+        def normalize():
+            for row in original_rows:
+                values = row.get("scores_by_step")
+                if not isinstance(values, dict):
+                    raise ValueError("Existing Test 1 row lacks scores_by_step")
+                for key in step_keys:
+                    if key not in values:
+                        raise ValueError(f"Existing Test 1 row missing step {key}")
+                    finite(values[key])
+                if "reward_after" in row:
+                    if not math.isclose(
+                        finite(row["reward_after"]),
+                        finite(values[step_keys[-1]]),
+                        rel_tol=1e-6,
+                        abs_tol=1e-6,
+                    ):
+                        raise ValueError("Existing row reward_after != last checkpoint")
+                else:
+                    row["reward_after"] = finite(values[step_keys[-1]])
+                yield row
+
+        self.existing = normalize()
+
+
 def adapted_checkpoints(model, inputs, target, lr, steps):
     """Stateless, full-model SGD; record scores along a single trajectory."""
     import torch
@@ -107,7 +144,7 @@ def score(args):
         "revision": args.revision,
         "max_length": args.max_length,
     }
-    writer = ResumeWriter(args.output / "step_scores.jsonl", cfg)
+    writer = StepResumeWriter(args.output / "step_scores.jsonl", cfg)
     adapter = None
     expected_settings = None
     seen = 0
@@ -161,6 +198,7 @@ def score(args):
                         "dummy_reward": dummy,
                         "dummy_calibration_pool": args.dummy_pool,
                         "reward_before": before,
+                        "reward_after": scores[str(steps[-1])],
                         "scores_by_step": scores,
                         "finite": True,
                     })
