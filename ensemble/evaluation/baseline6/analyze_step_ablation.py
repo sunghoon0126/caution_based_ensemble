@@ -176,7 +176,7 @@ def verify_against_existing_curves(rows, path):
         if key not in reference:
             raise ValueError(f"Missing reference curve: {key}")
         expected_accuracy, expected_flip = reference[key]
-        if (abs(expected_accuracy - row["accuracy_percent"]) > 1e-7 or
+        if (abs(expected_accuracy - row["updated_accuracy_percent"]) > 1e-7 or
                 abs(expected_flip - row["flip_rate_percent"]) > 1e-7):
             raise ValueError(
                 f"Mismatch with Test 1 evaluation for {key}: "
