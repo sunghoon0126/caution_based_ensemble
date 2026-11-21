@@ -17,6 +17,7 @@ import argparse
 import csv
 import json
 import math
+import time
 from collections import Counter
 from pathlib import Path
 
@@ -140,12 +141,35 @@ def run_worker(args):
                        for p in range(s["pilot_problems"]))
     target_count = own_problems * s["scored_candidates"]
     seen = newly = 0
-    try:
-        from tqdm.auto import tqdm
-        bar = tqdm(total=target_count, desc=f"SGD LHS GPU rank {args.rank}",
-                   unit="cand", dynamic_ncols=True)
-    except ImportError:
-        bar = None
+    if args.log_every < 1:
+        raise ValueError("--log-every must be positive")
+    started = time.monotonic()
+    print(f"[rank {args.rank}] Worker started; assigned "
+          f"{own_problems} problems / {target_count:,} candidates; "
+          f"arms={len(design['designs'])}; device={args.device}", flush=True)
+
+    def report():
+        if not args.plain_progress:
+            return
+        if seen % args.log_every != 0 and seen != target_count:
+            return
+        elapsed = max(time.monotonic() - started, 1e-6)
+        rate = seen / elapsed
+        eta = (target_count - seen) / rate if rate > 0 else float("inf")
+        print(f"[rank {args.rank}] {seen:,}/{target_count:,} "
+              f"({100 * seen / target_count:.2f}%) "
+              f"new={newly:,}; avg={rate:.3f} cand/s; "
+              f"elapsed={elapsed / 60:.1f} min; ETA={eta / 60:.1f} min",
+              flush=True)
+
+    bar = None
+    if not args.plain_progress:
+        try:
+            from tqdm.auto import tqdm
+            bar = tqdm(total=target_count, desc=f"SGD LHS GPU rank {args.rank}",
+                       unit="cand", dynamic_ncols=True)
+        except ImportError:
+            pass
     try:
         for p, full in enumerate(groups(Path(s["original"]), s["dummy_pool"])):
             if p >= s["pilot_problems"]:
@@ -160,6 +184,7 @@ def run_worker(args):
                 if completed:
                     if bar:
                         bar.update(1)
+                    report()
                     continue
                 if adapter is None:
                     print(f"Loading RM on {args.device} for rank {args.rank}", flush=True)
@@ -201,6 +226,7 @@ def run_worker(args):
                 newly += 1
                 if bar:
                     bar.update(1)
+                report()
             if p == args.rank or (p + 1) % 10 == 0:
                 print(f"[rank {args.rank}] visited {seen:,}/{target_count:,}, "
                       f"new {newly:,}, problem index={p}", flush=True)
@@ -445,6 +471,10 @@ def main():
     p.add_argument("--rank", type=int, default=-1)
     p.add_argument("--world-size", type=int, default=2)
     p.add_argument("--device", default="cuda:0")
+    p.add_argument("--plain-progress", action="store_true",
+                   help="Print newline progress instead of tqdm, useful for merged tmux logs")
+    p.add_argument("--log-every", type=int, default=1,
+                   help="Report every N visited candidates with --plain-progress")
     p.add_argument("--lambdas", nargs="+", type=float, default=list(DEFAULT_LAMBDAS))
     args = p.parse_args()
     if args.mode == "init":
