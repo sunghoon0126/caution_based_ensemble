@@ -315,17 +315,64 @@ def prepare(args):
     print(f"Preparation complete: {out}", flush=True)
 
 
+def prepare_transfer(args):
+    if args.selection_dir is None or args.original is None:
+        raise ValueError("transfer-prepare requires --selection-dir and --original")
+    base = load_manifest(args.selection_dir)
+    if base.get("transfer_dataset"):
+        raise ValueError("Select from the original GSM8K pilot, not a transfer run")
+    settings = dict(base["pilot_config"]["settings"])
+    if (args.full_problems <= 0 or args.full_candidates <= 0
+            or args.full_candidates > settings["dummy_pool"]
+            or args.full_candidates & (args.full_candidates - 1)):
+        raise ValueError("Invalid transfer problem/candidate count")
+    # Keep the same RM settings and 512-candidate minimum target.
+    settings.update(original=str(args.original.resolve()), pilot_problems=0,
+                    scored_candidates=args.full_candidates)
+    cfg = dict(base["pilot_config"], settings=settings)
+    manifest = dict(base, pilot_config=cfg, full_problems=args.full_problems,
+                    full_candidates=args.full_candidates, transfer_dataset=args.dataset,
+                    selection_dir=str(args.selection_dir.resolve()))
+    out = args.output_dir
+    out.mkdir(parents=True, exist_ok=True)
+    dest = out/"selected_config.json"
+    if dest.exists() and json.loads(dest.read_text()) != manifest:
+        raise ValueError("Transfer config differs; choose another output directory")
+    dest.write_text(json.dumps(manifest, indent=2))
+    print(f"Transfer {args.dataset}: {args.full_problems} problems x "
+          f"{args.full_candidates} scored candidates; dummy pool={settings['dummy_pool']}")
+    print(f"Selected settings: {[label(a) for a in manifest['selected']]}")
+    print(f"Original score input: {settings['original']}", flush=True)
+
+
+def output_shard(args, rank):
+    # Keep the single-GPU run separate from any earlier two-GPU shard.
+    return args.output_dir/("single_gpu.jsonl" if args.world_size == 1
+                           else f"rank_{rank}.jsonl")
+
+
+def shard_config(m, args, rank):
+    result = {"manifest": m, "rank": rank}
+    if args.world_size == 1:
+        result["world_size"] = 1
+    return result
+
+
 def worker(args):
     m = load_manifest(args.output_dir)
     s = m["pilot_config"]["settings"]
     arms = m["selected"]
     n, problems = m["full_candidates"], m["full_problems"]
-    if args.rank not in (0, 1) or args.log_every <= 0:
+    if not 0 <= args.rank < args.world_size or args.log_every <= 0:
         raise ValueError("Invalid rank/log interval")
-    sources = open_sources(m, args.rank)
-    writer = ResumeWriter(args.output_dir/f"rank_{args.rank}.jsonl",
-                          {"manifest": m, "rank": args.rank})
-    total = sum(p%2 == args.rank for p in range(problems))*n
+    transfer = bool(m.get("transfer_dataset"))
+    if transfer and args.world_size != 1:
+        raise ValueError("Transfer mode uses a single GPU")
+    cache_ranks = (0, 1) if args.world_size == 1 else (args.rank,)
+    sources = {r: ({} if transfer else open_sources(m, r)) for r in cache_ranks}
+    writer = ResumeWriter(output_shard(args, args.rank),
+                          shard_config(m, args, args.rank))
+    total = sum(p%args.world_size == args.rank for p in range(problems))*n
     done = reused = calculated = 0
     adapter = None
     start = time.monotonic()
@@ -336,9 +383,18 @@ def worker(args):
                 break
             if int(full[0]["dataset_index"]) != p:
                 raise ValueError("Expected zero-based sequential dataset index")
-            if p%2 != args.rank:
+            if p%args.world_size != args.rank:
                 continue
-            cache = get_cached(m, sources, p)
+            if transfer and any(row["dataset"] != m["transfer_dataset"] for row in full):
+                raise ValueError(f"Unexpected transfer dataset at problem {p}")
+            cache = get_cached(m, sources[p%2], p)
+            if transfer:
+                expected_cfg = {"backend": "pair" if s["reward_backend"] == "auto" else s["reward_backend"],
+                                "dtype": s["dtype"], "revision": s["revision"],
+                                "max_length": s["max_length"]}
+                if any(row.get("reward_model_path") != s["reward_model"] or
+                       row.get("reward_scoring_config") != expected_cfg for row in full):
+                    raise ValueError("Transfer original-score configuration mismatch")
             dummy = min(finite(row["reward_model_score"]) for row in full)
             context = {"dummy_reward": dummy, "pool_hash": digest(full)}
             for i, row in enumerate(full[:n]):
@@ -387,8 +443,9 @@ def worker(args):
             raise ValueError(f"Missing candidates: {done}/{total}")
     finally:
         writer.close()
-        for src in sources.values():
-            src.close()
+        for srcs in sources.values():
+            for src in srcs.values():
+                src.close()
     print(f"[rank {args.rank}] Complete", flush=True)
 
 
@@ -400,19 +457,21 @@ def evaluate(args):
     counts, totals = defaultdict(Counter), Counter()
     pilot_count = m["pilot_config"]["settings"]["pilot_problems"]
     seen = set()
-    for rank in (0, 1):
-        for rows in groups(args.output_dir/f"rank_{rank}.jsonl", n):
+    for rank in range(args.world_size):
+        for rows in groups(output_shard(args, rank), n):
             p = int(rows[0]["dataset_index"])
-            if p in seen or p%2 != rank or p >= m["full_problems"]:
+            if p in seen or p%args.world_size != rank or p >= m["full_problems"]:
                 raise ValueError(f"Unexpected problem {p}")
             seen.add(p)
-            if any(not r.get("finite") or r["backprop_config"] != {"manifest":m,"rank":rank} for r in rows):
+            if any(not r.get("finite") or r["backprop_config"] != shard_config(m, args, rank) for r in rows):
                 raise ValueError("Invalid result")
             original = np.asarray([finite(r["reward_model_score"]) for r in rows])
             scores = {"vanilla": original}
             for a in m["selected"]:
                 scores[a["method"]] = np.asarray([finite(r["scores_by_method"][a["method"]]) for r in rows])
-            add_problem(counts, totals, ("all", "pilot" if p < pilot_count else "unseen"),
+            subsets = ("all",) if m.get("transfer_dataset") else (
+                "all", "pilot" if p < pilot_count else "unseen")
+            add_problem(counts, totals, subsets,
                         [int(r["correct"]) for r in rows], scores, ns)
     if seen != set(range(m["full_problems"])):
         raise ValueError("Incomplete full experiment")
@@ -446,7 +505,7 @@ def evaluate(args):
             pts = [r for r in curves if r["subset"]==split and r["method"]==method]
             ax.plot(ns,[r["accuracy_percent"] for r in pts],marker="o",linewidth=1.8,label=labels[method])
         ax.set_xscale("log",base=2); ax.set_xticks(ns,[str(v) for v in ns])
-        ax.set(xlabel="Best-of-N budget",ylabel="Accuracy (%)",title=f"Full SGD evaluation | {split} ({totals[split]} problems)")
+        ax.set(xlabel="Best-of-N budget",ylabel="Accuracy (%)",title=f"{m.get('transfer_dataset', 'GSM8K')} SGD evaluation | {split} ({totals[split]} problems)")
         ax.grid(alpha=.2); ax.legend(); fig.tight_layout()
         save_figure(fig,out,f"accuracy_vs_n_{split}")
     for row in summary:
@@ -455,7 +514,7 @@ def evaluate(args):
 
 def main():
     p = argparse.ArgumentParser(description=__doc__)
-    p.add_argument("mode", choices=("prepare","worker","evaluate","lambda"))
+    p.add_argument("mode", choices=("prepare","transfer-prepare","worker","evaluate","lambda"))
     p.add_argument("--output-dir", type=Path, required=True)
     p.add_argument("--pilot",type=Path)
     p.add_argument("--select-split",choices=("tune","all"),default="tune")
@@ -463,6 +522,10 @@ def main():
     p.add_argument("--skip-lambda",action="store_true")
     p.add_argument("--full-problems",type=int,default=1000)
     p.add_argument("--full-candidates",type=int,default=512)
+    p.add_argument("--selection-dir",type=Path)
+    p.add_argument("--original",type=Path)
+    p.add_argument("--dataset",choices=("logiqa2","arc_challenge"),default="logiqa2")
+    p.add_argument("--world-size",type=int,choices=(1,2),default=2)
     p.add_argument("--rank",type=int,default=-1)
     p.add_argument("--device",default="cuda:0")
     p.add_argument("--log-every",type=int,default=20)
@@ -471,10 +534,15 @@ def main():
         if args.pilot is None:
             p.error("prepare requires --pilot")
         prepare(args)
+    elif args.mode=="transfer-prepare":
+        prepare_transfer(args)
     elif args.mode=="worker":
         worker(args)
     elif args.mode=="lambda":
-        lambda_pilot(load_manifest(args.output_dir), args.output_dir)
+        manifest = load_manifest(args.output_dir)
+        if manifest.get("transfer_dataset"):
+            raise ValueError("Lambda tuning uses the original GSM8K pilot")
+        lambda_pilot(manifest, args.output_dir)
     else:
         evaluate(args)
 
