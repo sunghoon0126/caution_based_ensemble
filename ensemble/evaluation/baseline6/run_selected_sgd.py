@@ -289,10 +289,10 @@ def prepare(args):
             raise ValueError("Summary/design mismatch")
         selected.append(dict(spec, pilot_accuracy=float(r["final_accuracy_percent"])))
         seen.add(key)
-        if len(selected) == 3:
+        if len(selected) == args.top_k:
             break
-    if len(selected) != 3:
-        raise ValueError("Need at least three distinct settings")
+    if len(selected) != args.top_k:
+        raise ValueError(f"Need {args.top_k} distinct settings")
     manifest = {"version": 1, "pilot": str(pilot), "pilot_config": cfg,
                 "selected": selected, "select_split": args.select_split,
                 "full_problems": args.full_problems, "full_candidates": args.full_candidates}
@@ -302,7 +302,7 @@ def prepare(args):
     if f.exists() and json.loads(f.read_text()) != manifest:
         raise ValueError("Selected config changed; use a fresh output directory")
     f.write_text(json.dumps(manifest, indent=2))
-    write_csv(out/"selected_top3.csv", [
+    write_csv(out/f"selected_top{args.top_k}.csv", [
         {"rank": i+1, "method": label(a), "source": a["method"],
          "learning_rate": a["lr"], "steps": a["steps"],
          "selection_split": args.select_split, "pilot_n256_accuracy": a["pilot_accuracy"]}
@@ -310,7 +310,8 @@ def prepare(args):
     for a in selected:
         print(f"Selected {label(a)} ({a['method']}): {a['pilot_accuracy']:.2f}%", flush=True)
     plot_all(pilot, specs, out)
-    lambda_pilot(manifest, out)
+    if not args.skip_lambda:
+        lambda_pilot(manifest, out)
     print(f"Preparation complete: {out}", flush=True)
 
 
@@ -454,10 +455,12 @@ def evaluate(args):
 
 def main():
     p = argparse.ArgumentParser(description=__doc__)
-    p.add_argument("mode", choices=("prepare","worker","evaluate"))
+    p.add_argument("mode", choices=("prepare","worker","evaluate","lambda"))
     p.add_argument("--output-dir", type=Path, required=True)
     p.add_argument("--pilot",type=Path)
     p.add_argument("--select-split",choices=("tune","all"),default="tune")
+    p.add_argument("--top-k",type=int,choices=(1,2,3),default=3)
+    p.add_argument("--skip-lambda",action="store_true")
     p.add_argument("--full-problems",type=int,default=1000)
     p.add_argument("--full-candidates",type=int,default=512)
     p.add_argument("--rank",type=int,default=-1)
@@ -470,6 +473,8 @@ def main():
         prepare(args)
     elif args.mode=="worker":
         worker(args)
+    elif args.mode=="lambda":
+        lambda_pilot(load_manifest(args.output_dir), args.output_dir)
     else:
         evaluate(args)
 
