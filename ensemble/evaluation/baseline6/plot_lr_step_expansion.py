@@ -5,8 +5,8 @@ rewards (no lambda). Selection of featured arms uses TUNE N=max only; the
 HOLDOUT set is never used to select the featured arms.
 
 Charts for all/tune/holdout:
-  focused_accuracy_vs_n_<split>.png   Vanilla (bold) vs 3 best tuned arms
-  overview_accuracy_vs_n_<split>.png  All arms gray, vanilla bold, top-3 colored
+  focused_accuracy_vs_n_<split>.png   Vanilla (soft halo) vs 3 best tuned arms
+  overview_accuracy_vs_n_<split>.png  All arms gray, vanilla soft halo, top-3 colored
   n256_delta_ranked_<split>.png       All arms' N=256 delta vs vanilla (pp)
   lr_step_delta_heatmap_<split>.png   New grid difference vs vanilla N=256
 """
@@ -24,7 +24,7 @@ import numpy as np
 
 SPLITS = ("all", "tune", "holdout")
 ACCENT = ("#2563eb", "#e07b12", "#16a085")
-BASELINE = "#111827"
+BASELINE = "#59677b"
 OTHER = "#94a3b8"
 
 
@@ -34,15 +34,12 @@ def load_csv(path):
 
 
 def prettify(method_row):
-    origin = method_row["origin"]
-    if origin == "vanilla":
-        return "Vanilla RM (no update)"
+    """Same step_lr label for Test 1, previous LHS, and new LR grid."""
+    if method_row["origin"] == "vanilla":
+        return "vanilla"
     lr = float(method_row["learning_rate"])
     step = int(method_row["steps"])
-    source = {"test1": "Test 1", "old_lhs": "Old LHS", "new": "New grid"}.get(
-        origin, origin
-    )
-    return f"LR={lr:.2g}, steps={step} [{source}]"
+    return f"step{step}_lr{lr:.6g}"
 
 
 def save(fig, out, name, dpi):
@@ -64,31 +61,18 @@ def plot_curves(dataset, meta, chosen, subset, out, dpi, overview):
             data = by_method[method]
             ax.plot(ns, [data[n] for n in ns], color=OTHER, alpha=0.18,
                     linewidth=0.9, zorder=1)
-    ax.plot(ns, [vanilla[n] for n in ns], color="white", linewidth=5.6,
-            zorder=7, solid_capstyle="round")
-    ax.plot(ns, [vanilla[n] for n in ns], color=BASELINE, linewidth=3.3,
-            linestyle="--", marker="s", markersize=6.0, zorder=8,
-            label="Vanilla RM — baseline")
-
-    if "test1_s1" in by_method and "test1_s1" not in chosen:
-        previous = by_method["test1_s1"]
-        ax.plot(ns, [previous[n] for n in ns], color="#7c3aed",
-                linewidth=1.8, linestyle=":", marker="D", markersize=3.8,
-                alpha=0.85, zorder=4, label="Previous SGD (LR=1e-6, 1 step)")
+    # Vanilla: only a light halo. No bold baseline stroke or text callout.
+    baseline_values = [vanilla[n] for n in ns]
+    ax.plot(ns, baseline_values, color="#94a3b8", linewidth=6.0,
+            alpha=0.17, zorder=3, solid_capstyle="round")
+    ax.plot(ns, baseline_values, color=BASELINE, linewidth=2.0,
+            marker="o", markersize=4.3, zorder=4, label="vanilla")
 
     for i, method in enumerate(chosen):
         data = by_method[method]
         ax.plot(ns, [data[n] for n in ns], color=ACCENT[i], linewidth=2.5,
                 marker="o", markersize=4.9, zorder=5-i,
                 label=prettify(meta[method]))
-
-    base_final = vanilla[nmax]
-    ax.annotate(f"Vanilla at N={nmax}: {base_final:.1f}%",
-                xy=(nmax, base_final), xytext=(-9, -17),
-                textcoords="offset points", ha="right", va="top",
-                color=BASELINE, fontsize=9, fontweight="bold",
-                bbox={"boxstyle": "round,pad=.25", "fc": "white",
-                      "ec": "#cbd5e1", "alpha": 0.92}, zorder=10)
 
     ax.set_xscale("log", base=2)
     ax.set_xticks(ns, [str(n) for n in ns])
@@ -111,8 +95,7 @@ def plot_nmax_delta(rows, meta, chosen, subset, out, dpi):
     others = [r for r in subset_rows if r["origin"] != "vanilla"]
     others.sort(key=lambda r: float(r["final_accuracy_percent"]) - base)
     values = [float(r["final_accuracy_percent"]) - base for r in others]
-    labels = [f"{r['method']}  ({float(r['learning_rate']):.2g}, "
-              f"k={int(r['steps'])})" for r in others]
+    labels = [prettify(r) for r in others]
     colors = [ACCENT[chosen.index(r["method"])]
               if r["method"] in chosen else
               ("#8596af" if r["origin"] == "new" else "#cbd5e1")
@@ -121,12 +104,11 @@ def plot_nmax_delta(rows, meta, chosen, subset, out, dpi):
     positions = np.arange(len(others))
     ax.barh(positions, values, color=colors, height=0.77, zorder=3)
     ax.set_yticks(positions, labels, fontsize=8)
-    ax.axvline(0, color=BASELINE, linewidth=2.4, linestyle="--",
-               zorder=5, label=f"Vanilla RM = {base:.1f}% (0 pp)")
+    ax.axvline(0, color=BASELINE, linewidth=1.3, alpha=0.70,
+               zorder=5)
     ax.set_xlabel("Accuracy change vs Vanilla at N=max (percentage points)")
-    ax.set_title(f"{subset.capitalize()} | All LR/Step settings vs Vanilla RM")
+    ax.set_title(f"{subset.capitalize()} | N=max accuracy change vs vanilla ({base:.1f}%)")
     ax.grid(axis="x", alpha=0.18, zorder=0)
-    ax.legend(fontsize=9)
     xmax = max(1, max(abs(v) for v in values))
     ax.set_xlim(min(values + [0]) - xmax*.22, max(values + [0]) + xmax*.22)
     for k, value in enumerate(values):
