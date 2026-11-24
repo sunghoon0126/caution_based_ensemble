@@ -70,6 +70,12 @@ def plot_curves(dataset, meta, chosen, subset, out, dpi, overview):
             linestyle="--", marker="s", markersize=6.0, zorder=8,
             label="Vanilla RM — baseline")
 
+    if "test1_s1" in by_method and "test1_s1" not in chosen:
+        previous = by_method["test1_s1"]
+        ax.plot(ns, [previous[n] for n in ns], color="#7c3aed",
+                linewidth=1.8, linestyle=":", marker="D", markersize=3.8,
+                alpha=0.85, zorder=4, label="Previous SGD (LR=1e-6, 1 step)")
+
     for i, method in enumerate(chosen):
         data = by_method[method]
         ax.plot(ns, [data[n] for n in ns], color=ACCENT[i], linewidth=2.5,
@@ -178,6 +184,9 @@ def main():
                    help="Defaults to <evaluation-dir>/readable_plots")
     p.add_argument("--top-k", type=int, default=3)
     p.add_argument("--dpi", type=int, default=200)
+    p.add_argument("--splits", nargs="+", choices=SPLITS,
+                   default=["holdout"],
+                   help="Default: only holdout. For all use --splits all tune holdout")
     args = p.parse_args()
     if not 1 <= args.top_k <= len(ACCENT):
         p.error(f"--top-k must be 1..{len(ACCENT)}")
@@ -215,7 +224,7 @@ def main():
     out = args.output_dir or args.evaluation_dir / "readable_plots"
     out.mkdir(parents=True, exist_ok=True)
 
-    for subset in SPLITS:
+    for subset in args.splits:
         plot_curves(by_split, meta, chosen, subset, out, args.dpi, overview=False)
         plot_curves(by_split, meta, chosen, subset, out, args.dpi, overview=True)
         plot_nmax_delta(summaries, meta, chosen, subset, out, args.dpi)
