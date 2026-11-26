@@ -341,7 +341,7 @@ def main():
     p.add_argument("--output-dir",type=Path,required=True)
     p.add_argument("--dataset",choices=("gsm8k","logiqa2","arc_challenge"),default="gsm8k")
     p.add_argument("--problems",type=int,default=1000)
-    p.add_argument("--world-size",type=int,choices=(1,2),default=1)
+    p.add_argument("--world-size",type=int,choices=(1,2,3,4),default=1)
     p.add_argument("--rank",type=int,default=0)
     p.add_argument("--batch-size",type=int,default=8)
     p.add_argument("--device",default="cuda:0")
