@@ -240,11 +240,26 @@ def evaluate(args):
     proof=json.loads((args.output_dir/"verification.json").read_text())
     if c!=proof["config"]:
         raise ValueError("Verification config mismatch")
-    out=args.output_dir/"evaluation"; out.mkdir(exist_ok=True)
-    methods=["vanilla"]+[m for m,_,_ in ARMS]
+    lrs=sorted(set(args.eval_lrs if args.eval_lrs is not None else c["lrs"]))
+    if not lrs or any(not math.isfinite(lr) or lr<=0 for lr in lrs):
+        raise ValueError("Evaluation learning rates must be positive and finite")
+    out=(args.evaluation_dir or args.output_dir/"evaluation").resolve()
+    if lrs!=sorted(c["lrs"]) and out==(args.output_dir/"evaluation").resolve():
+        raise ValueError("Expanded LR sweep requires --evaluation-dir to preserve old results")
+    if out==args.output_dir.resolve():
+        raise ValueError("Evaluation directory must differ from feature directory")
+    out.mkdir(parents=True,exist_ok=True)
+    eval_config=dict(feature_config=c,lrs=lrs,steps=c["steps"],
+                     calculation="closed_form_float64",source_dir=str(args.output_dir.resolve()))
+    meta=out/"evaluation_config.json"
+    if meta.exists() and json.loads(meta.read_text())!=eval_config:
+        raise ValueError("Evaluation config changed; choose a different evaluation directory")
+    meta.write_text(json.dumps(eval_config,indent=2))
+    arms=[(f"step{k}_lr{lr:g}",lr,k) for lr in lrs for k in c["steps"]]
+    methods=["vanilla"]+[m for m,_,_ in arms]
     counts,totals=defaultdict(Counter),Counter()
     size=c["problems"]*N
-    pen=np.empty((len(ARMS),size),dtype=np.float64)
+    pen=np.empty((len(arms),size),dtype=np.float64)
     rel=np.empty_like(pen)
     truth=np.empty(size,dtype=bool)
     norms=np.empty(size,dtype=np.float64)
@@ -272,7 +287,7 @@ def evaluate(args):
             top[p*16:(p+1)*16]=p*N+np.argsort(-orig,kind="stable")[:16]
             scores={"vanilla":orig}
             gap=orig-dummy
-            for j,(m,lr,k) in enumerate(ARMS):
+            for j,(m,lr,k) in enumerate(arms):
                 factor=1-(1-lr*a)**k
                 v=gap*factor
                 if not np.isfinite(v).all():
@@ -289,7 +304,7 @@ def evaluate(args):
         for s in sources:
             s.close()
     curves=summarize(counts,totals,methods,NS)
-    lookup={m:(lr,k) for m,lr,k in ARMS}
+    lookup={m:(lr,k) for m,lr,k in arms}
     for r in curves:
         r["learning_rate"],r["steps"]=lookup.get(r["method"],(0.,0))
     summary=[]
@@ -308,7 +323,7 @@ def evaluate(args):
     stats=[]
     for scope,ids in (("all",np.arange(size)),("top16_original",top)):
         t=truth[ids]
-        for j,(m,lr,k) in enumerate(ARMS):
+        for j,(m,lr,k) in enumerate(arms):
             v=pen[j,ids]; f=rel[j,ids]
             good,bad=v[t],v[~t]
             g,b=f[t],f[~t]
@@ -324,11 +339,33 @@ def evaluate(args):
                 unstable_fraction=mean(lr*norms[ids]>=2),
                 overshoot_fraction=mean(lr*norms[ids]>1)))
     write_csv(out/"penalty_by_lr_step.csv",stats)
-    write_csv(out/"stability.csv",[dict(learning_rate=lr,effective_lr_min=float(lr*norms.min()),
-        effective_lr_median=float(lr*np.median(norms)),effective_lr_max=float(lr*norms.max()),
-        unstable_fraction=mean(lr*norms>=2)) for lr in LRS])
+    stability=[dict(learning_rate=lr,effective_lr_min=float(lr*norms.min()),
+        effective_lr_median=float(lr*np.median(norms)),
+        effective_lr_p95=float(lr*np.quantile(norms,.95)),
+        effective_lr_p99=float(lr*np.quantile(norms,.99)),
+        effective_lr_max=float(lr*norms.max()),
+        overshoot_fraction=mean(lr*norms>1),
+        unstable_fraction=mean(lr*norms>=2)) for lr in lrs]
+    write_csv(out/"stability.csv",stability)
+    for row in stability:
+        print(f"LR={row['learning_rate']:g} effective max={row['effective_lr_max']:.6g} "
+              f"overshoot={100*row['overshoot_fraction']:.3f}% "
+              f"unstable={100*row['unstable_fraction']:.3f}%",flush=True)
     from ensemble.evaluation.baseline6.plot_last_layer_sweep import plot_all
-    plot_all(out,curves,summary,stats,c)
+    plot_all(out,curves,summary,stats,dict(c,lrs=lrs))
+    stable_lrs=[r["learning_rate"] for r in stability if r["unstable_fraction"]==0]
+    if stable_lrs and len(stable_lrs)!=len(lrs):
+        stable=out/"stable_only"; stable.mkdir(exist_ok=True)
+        keep=lambda r:r["method"]=="vanilla" or r["learning_rate"] in stable_lrs
+        cs=[r for r in curves if keep(r)]
+        ss=[r for r in summary if keep(r)]
+        ps=[r for r in stats if keep(r)]
+        write_csv(stable/"curves.csv",cs)
+        write_csv(stable/"summary.csv",ss)
+        write_csv(stable/"penalty_by_lr_step.csv",ps)
+        plot_all(stable,cs,ss,ps,dict(c,lrs=stable_lrs))
+    if not stable_lrs:
+        print("WARNING: No LR stable for every candidate.",flush=True)
     for r in sorted(summary,key=lambda r:-r["final_accuracy_percent"])[:6]:
         print(r,flush=True)
     print(f"Saved all results and plots to {out}",flush=True)
@@ -347,9 +384,13 @@ def main():
     p.add_argument("--device",default="cuda:0")
     p.add_argument("--verify-candidates",type=int,default=8)
     p.add_argument("--log-every",type=int,default=100)
+    p.add_argument("--eval-lrs",type=float,nargs="+",help="CPU evaluation LR override; cached feature manifest is unchanged")
+    p.add_argument("--evaluation-dir",type=Path,help="Separate directory for evaluation outputs")
     args=p.parse_args()
     if min(args.problems,args.batch_size,args.verify_candidates,args.log_every)<1:
         p.error("Positive sizes required")
+    if args.mode!="evaluate" and (args.eval_lrs is not None or args.evaluation_dir is not None):
+        p.error("--eval-lrs and --evaluation-dir are evaluation-only options")
     args.output_dir=args.output_dir.resolve()
     {"verify":verify,"extract":extract,"evaluate":evaluate}[args.mode](args)
 
