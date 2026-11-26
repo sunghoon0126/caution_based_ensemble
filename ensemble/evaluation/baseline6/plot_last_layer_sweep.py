@@ -24,15 +24,15 @@ def plot_all(out,curves,summary,stats,cfg):
     arms=sorted([r for r in summary if r["method"]!="vanilla"],
                 key=lambda r:(-r["final_accuracy_percent"],r["steps"],r["learning_rate"]))
     for name,chosen in (("all",arms),("top5",arms[:5])):
-        fig,ax=plt.subplots(figsize=(12,7))
+        fig,ax=plt.subplots(figsize=(14, max(7, 5.5+len(chosen)*.12)))
         methods=["vanilla"]+[r["method"] for r in chosen]
         handles=[]
         colors=list(plt.get_cmap("tab20").colors)
         for i,m in enumerate(methods):
             pts=sorted([r for r in curves if r["method"]==m],key=lambda r:r["N"])
             x=[r["N"] for r in pts]; y=[r["accuracy_percent"] for r in pts]
-            color="#59677b" if i==0 else colors[i-1]
-            style=("-","--","-.",":")[i%4]
+            color="#59677b" if i==0 else colors[(i-1)%len(colors)]
+            style=("-","--","-.",":")[((i-1)//len(colors)+i)%4]
             marker=("o","s","^","D","X","v")[i%6]
             if i==0:
                 ax.plot(x,y,color=color,linewidth=6,alpha=.12)
@@ -49,7 +49,7 @@ def plot_all(out,curves,summary,stats,cfg):
         ax.set(xlabel="Best-of-N",ylabel="Accuracy (%)",title=f"Accuracy vs N | {tag}")
         ax.grid(alpha=.2)
         ax.legend(handles=handles,loc="upper center",bbox_to_anchor=(.5,-.13),
-                  ncol=3 if name=="all" else 2,fontsize=8)
+                  ncol=4 if name=="all" else 2,fontsize=8)
         save(fig,out,f"accuracy_vs_n_{name}")
 
     def matrix(rows,key):
@@ -83,7 +83,7 @@ def plot_all(out,curves,summary,stats,cfg):
         norm=norm if norm is not None else norm_for(vals,diverge)
         cmap=plt.get_cmap("RdBu" if diverge else "Blues").copy()
         cmap.set_bad("#eeeeee")
-        fig,ax=plt.subplots(figsize=(8,5.8))
+        fig,ax=plt.subplots(figsize=(max(8,1.25*len(lrs)+2),5.8))
         im=ax.imshow(np.ma.masked_invalid(vals),origin="lower",aspect="auto",cmap=cmap,norm=norm)
         for i,j in np.ndindex(vals.shape):
             v=vals[i,j]
@@ -116,7 +116,7 @@ def plot_all(out,curves,summary,stats,cfg):
         c=matrix(rows,"mean_correct"); w=matrix(rows,"mean_incorrect")
         norm=norm_for(np.r_[c.ravel(),w.ravel()],bool(np.nanmin(np.r_[c.ravel(),w.ravel()])<0))
         cmap=plt.get_cmap("RdBu" if np.nanmin(np.r_[c.ravel(),w.ravel()])<0 else "Blues")
-        fig,ax=plt.subplots(figsize=(8,7))
+        fig,ax=plt.subplots(figsize=(max(8,1.25*len(lrs)+2),7))
         for i,j in np.ndindex(c.shape):
             for dy,v in ((0,c[i,j]),(-.48,w[i,j])):
                 color=cmap(norm(v)) if np.isfinite(v) else "#eeeeee"
