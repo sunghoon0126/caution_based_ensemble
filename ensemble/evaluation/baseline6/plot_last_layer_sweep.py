@@ -20,7 +20,7 @@ def save(fig,out,name):
 def plot_all(out,curves,summary,stats,cfg):
     lrs=sorted(cfg["lrs"])
     steps=sorted(cfg["steps"])
-    tag=f"{cfg['dataset']} | All {cfg['problems']} problems | classifier only"
+    tag=f"{cfg['dataset']} | All {cfg['problems']} problems | {cfg.get('scope_label', 'classifier only')}"
     arms=sorted([r for r in summary if r["method"]!="vanilla"],
                 key=lambda r:(-r["final_accuracy_percent"],r["steps"],r["learning_rate"]))
     for name,chosen in (("all",arms),("top5",arms[:5])):
